@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Paint</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="toolbar">
+            <div class="tool-section">
+                <button id="pencil" class="tool active">✏️ Pencil</button>
+                <button id="brush" class="tool">🖌️ Brush</button>
+                <button id="rectangle" class="tool">⬜ Rectangle</button>
+                <button id="circle" class="tool">⭕ Circle</button>
+                <button id="eraser" class="tool">🧹 Eraser</button>
+            </div>
+            <div class="tool-section">
+                <input type="color" id="colorPicker" value="#000000">
+                <label for="colorPicker">Color</label>
+            </div>
+            <div class="tool-section">
+                <input type="range" id="lineWidth" min="1" max="50" value="5">
+                <label for="lineWidth">Line Width</label>
+            </div>
+            <div class="tool-section">
+                <button id="clear">🗑️ Clear</button>
+                <button id="save">💾 Save</button>
+            </div>
+        </div>
+        <canvas id="canvas"></canvas>
+        <div class="ai-control">
+            <textarea id="aiPrompt" placeholder="Tell the AI what to draw..."></textarea>
+            <button id="sendPrompt">🤖 Send to AI</button>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html> 
