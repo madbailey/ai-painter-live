@@ -15,6 +15,11 @@ let startX = 0;
 let startY = 0;
 let drawingActions = [];
 let lastDrawingState = null;
+let streamingMode = false;
+let canvasUpdateInterval = null;
+let isProcessingStreamingCommand = false;
+let lastUpdateTimestamp = 0;
+let minUpdateInterval = 500;
 
 // Tool elements
 const tools = document.querySelectorAll('.tool');
@@ -26,6 +31,113 @@ const saveButton = document.getElementById('save');
 // AI Control elements
 const aiPrompt = document.getElementById('aiPrompt');
 const sendPromptButton = document.getElementById('sendPrompt');
+
+// Add streaming mode toggle
+let streamingModeToggle = document.createElement('div');
+streamingModeToggle.innerHTML = `
+    <div class="control-group streaming-controls">
+        <label for="streamingModeCheckbox">Streaming Mode</label>
+        <input type="checkbox" id="streamingModeCheckbox">
+        <div class="streaming-options" style="display: none;">
+            <div>
+                <label for="streamingInterval">Update Interval (ms):</label>
+                <input type="range" id="streamingInterval" min="100" max="1000" step="50" value="300">
+                <span id="streamingIntervalValue">300ms</span>
+            </div>
+            <div>
+                <label for="streamingBatchSize">Batch Size:</label>
+                <input type="range" id="streamingBatchSize" min="1" max="5" step="1" value="3">
+                <span id="streamingBatchSizeValue">3 commands</span>
+            </div>
+        </div>
+    </div>
+`;
+document.querySelector('.ai-control').appendChild(streamingModeToggle);
+
+// Get references to new controls
+const streamingModeCheckbox = document.getElementById('streamingModeCheckbox');
+const streamingInterval = document.getElementById('streamingInterval');
+const streamingIntervalValue = document.getElementById('streamingIntervalValue');
+const streamingBatchSize = document.getElementById('streamingBatchSize');
+const streamingBatchSizeValue = document.getElementById('streamingBatchSizeValue');
+const streamingOptions = document.querySelector('.streaming-options');
+
+// Add event listeners for streaming controls
+streamingModeCheckbox.addEventListener('change', (e) => {
+    streamingMode = e.target.checked;
+    streamingOptions.style.display = streamingMode ? 'block' : 'none';
+    
+    // Only update server when toggled manually (not during initial page load)
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'TOGGLE_STREAMING_MODE',
+            enabled: streamingMode,
+            interval: parseInt(streamingInterval.value),
+            batchSize: parseInt(streamingBatchSize.value)
+        }));
+    }
+    
+    updateStreamingStatus();
+});
+
+streamingInterval.addEventListener('input', (e) => {
+    const value = parseInt(e.target.value);
+    streamingIntervalValue.textContent = `${value}ms`;
+    
+    if (streamingMode && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'TOGGLE_STREAMING_MODE',
+            enabled: streamingMode,
+            interval: value,
+            batchSize: parseInt(streamingBatchSize.value)
+        }));
+    }
+});
+
+streamingBatchSize.addEventListener('input', (e) => {
+    const value = parseInt(e.target.value);
+    streamingBatchSizeValue.textContent = `${value} command${value !== 1 ? 's' : ''}`;
+    
+    if (streamingMode && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'TOGGLE_STREAMING_MODE',
+            enabled: streamingMode,
+            interval: parseInt(streamingInterval.value),
+            batchSize: value
+        }));
+    }
+});
+
+// Update UI to show streaming status
+function updateStreamingStatus() {
+    const statusEl = document.getElementById('streamingStatus') || (() => {
+        const el = document.createElement('div');
+        el.id = 'streamingStatus';
+        el.style.position = 'absolute';
+        el.style.top = '10px';
+        el.style.right = '10px';
+        el.style.background = 'rgba(0,0,0,0.7)';
+        el.style.color = 'white';
+        el.style.padding = '5px 10px';
+        el.style.borderRadius = '5px';
+        el.style.zIndex = '1000';
+        document.querySelector('.container').appendChild(el);
+        return el;
+    })();
+    
+    if (streamingMode) {
+        statusEl.textContent = '🔄 Streaming Mode: Active';
+        statusEl.style.display = 'block';
+        
+        // Highlight active inputs when in streaming mode
+        aiPrompt.classList.add('streaming-active');
+        sendPromptButton.classList.add('streaming-active');
+    } else {
+        statusEl.style.display = 'none';
+        aiPrompt.classList.remove('streaming-active');
+        sendPromptButton.classList.remove('streaming-active');
+    }
+}
 
 // Default settings
 ctx.strokeStyle = colorPicker.value;
@@ -48,7 +160,12 @@ ws.onmessage = (event) => {
             break;
         case 'DRAW_ACTION':
             console.log('Executing draw action:', data.action);
-            executeDrawAction(data.action);
+            // Make sure action has all needed properties
+            if (data.action && (data.action.startX !== undefined || data.action.x !== undefined)) {
+                executeDrawAction(data.action);
+            } else {
+                console.error('Invalid draw action received:', data.action);
+            }
             break;
         case 'CLEAR_CANVAS':
             console.log('Clearing canvas');
@@ -88,35 +205,112 @@ ws.onmessage = (event) => {
             showDrawingStatus(`AI continuing to draw in Phase ${currentPhase}...`);
             break;
         case 'PHASE_CHANGE':
-            console.log(`Advancing to Phase ${data.phase} (${data.completionPercentage}% complete)`);
-            // Display phase transition
+            console.log('Phase changed to:', data.phase, 'Completion:', data.completionPercentage, '%');
             showPhaseTransition(data.phase);
-            // Update the completion progress with phase info
             updateCompletionProgress(data.completionPercentage, data.phase);
             break;
         case 'COMPLETION_UPDATE':
-            console.log('Drawing completion update:', data.percentage + '%');
+            console.log('Drawing progress update:', data.percentage, '%');
             updateCompletionProgress(data.percentage, data.phase);
             break;
         case 'DRAWING_COMPLETE':
-            console.log('Drawing is complete!');
+            console.log('Drawing complete!');
             showDrawingStatus('Drawing complete!');
-            
             // Re-enable AI controls
             aiPrompt.disabled = false;
             sendPromptButton.disabled = false;
             break;
         case 'ERROR':
-            console.error('Server error:', data.message);
+            console.error('Error:', data.message);
+            showDrawingStatus(`Error: ${data.message}`);
             alert('Error: ' + data.message);
             break;
+        case 'STREAMING_MODE_UPDATE':
+            console.log('Streaming mode update:', data);
+            // Update UI controls without triggering change events
+            streamingMode = data.enabled;
+            streamingModeCheckbox.checked = streamingMode;
+            
+            if (data.interval) {
+                streamingInterval.value = data.interval;
+                streamingIntervalValue.textContent = `${data.interval}ms`;
+            }
+            
+            streamingOptions.style.display = streamingMode ? 'block' : 'none';
+            updateStreamingStatus();
+            break;
+            
+        case 'STREAMING_MODE_STARTED':
+            console.log('Streaming mode started for prompt:', data.prompt);
+            showDrawingStatus('AI starting to draw in streaming mode...');
+            
+            // Start sending canvas updates more frequently, but with throttling
+            if (canvasUpdateInterval) {
+                clearInterval(canvasUpdateInterval);
+            }
+            
+            const interval = parseInt(streamingInterval.value);
+            lastUpdateTimestamp = Date.now();
+            canvasUpdateInterval = setInterval(() => {
+                // Only send updates if not currently processing and enough time has passed
+                if (streamingMode && !isProcessingStreamingCommand && 
+                    (Date.now() - lastUpdateTimestamp >= minUpdateInterval)) {
+                    lastUpdateTimestamp = Date.now();
+                    sendCanvasState();
+                    console.log('Canvas state automatically updated');
+                }
+            }, interval);
+            break;
+            
+        case 'STREAMING_COMPLETE':
+            console.log('Streaming drawing complete');
+            showDrawingStatus('Streaming drawing complete!');
+            
+            // Stop frequent canvas updates
+            if (canvasUpdateInterval) {
+                clearInterval(canvasUpdateInterval);
+                canvasUpdateInterval = null;
+            }
+            
+            // Re-enable AI controls
+            aiPrompt.disabled = false;
+            sendPromptButton.disabled = false;
+            streamingMode = false;
+            updateStreamingStatus();
+            break;
+            
+        case 'REQUEST_CANVAS_UPDATE':
+            console.log('Server requested canvas update');
+            // Send the current canvas state immediately
+            sendCanvasState();
+            break;
+        
+        case 'STREAMING_COMMAND_START':
+            console.log('Server processing streaming command');
+            isProcessingStreamingCommand = true;
+            // Add a visual indicator that commands are being processed
+            showDrawingStatus('Processing streaming commands...');
+            break;
+        
+        case 'STREAMING_COMMAND_COMPLETE':
+            console.log('Server completed streaming command batch');
+            isProcessingStreamingCommand = false;
+            // Show that commands have been processed
+            showDrawingStatus('Drawing updated. Resuming streaming...');
+            // Allow a short delay before sending next update
+            setTimeout(() => {
+                lastUpdateTimestamp = Date.now() - minUpdateInterval;
+                // Explicitly send a canvas update to continue the streaming flow
+                if (streamingMode) {
+                    sendCanvasState();
+                    console.log('Sending canvas update after command completion');
+                }
+            }, 200);
+            break;
+        
         default:
             console.warn('Unknown message type:', data.type);
     }
-
-    // Re-enable AI controls after any message
-    aiPrompt.disabled = false;
-    sendPromptButton.disabled = false;
 };
 
 ws.onerror = (error) => {
@@ -271,55 +465,92 @@ function draw(e) {
 }
 
 function executeDrawAction(action) {
-    ctx.save();
+    console.log('Executing draw action:', action);
     
-    ctx.strokeStyle = action.color;
-    ctx.lineWidth = action.lineWidth;
-
-    if (action.tool === 'eraser') {
-        ctx.strokeStyle = '#ffffff';
+    // Set tool, color, and line width based on the action
+    if (action.tool) {
+        setTool(action.tool);
     }
-
-    switch (action.tool) {
+    
+    if (action.color) {
+        setColor(action.color);
+    }
+    
+    if (action.lineWidth) {
+        setLineWidth(action.lineWidth);
+    }
+    
+    // Always use the values from the action for the actual drawing, not the current client state
+    const actionTool = action.tool || currentTool;
+    const actionColor = action.color || ctx.strokeStyle;
+    const actionWidth = action.lineWidth || ctx.lineWidth;
+    
+    // Debug info - remove after verification
+    console.log(`Drawing with tool: ${actionTool}, color: ${actionColor}, width: ${actionWidth}`);
+    console.log(`Start: (${action.startX}, ${action.startY}), End: (${action.x}, ${action.y})`);
+    
+    switch (actionTool) {
         case 'pencil':
-        case 'brush':
-        case 'eraser':
             ctx.beginPath();
+            ctx.strokeStyle = actionColor;
+            ctx.lineWidth = actionWidth;
             ctx.moveTo(action.startX, action.startY);
             ctx.lineTo(action.x, action.y);
             ctx.stroke();
             break;
+            
+        case 'brush':
+            ctx.beginPath();
+            ctx.strokeStyle = actionColor;
+            ctx.lineWidth = actionWidth;
+            ctx.lineCap = 'round';
+            ctx.moveTo(action.startX, action.startY);
+            ctx.lineTo(action.x, action.y);
+            ctx.stroke();
+            break;
+            
         case 'rectangle':
+            const rectWidth = action.x - action.startX;
+            const rectHeight = action.y - action.startY;
             ctx.beginPath();
-            ctx.rect(action.startX, action.startY, action.x - action.startX, action.y - action.startY);
+            ctx.strokeStyle = actionColor;
+            ctx.lineWidth = actionWidth;
+            ctx.rect(action.startX, action.startY, rectWidth, rectHeight);
             ctx.stroke();
             break;
+            
         case 'circle':
-            const radius = Math.sqrt(
-                Math.pow(action.x - action.startX, 2) + 
-                Math.pow(action.y - action.startY, 2)
-            );
+            const radius = Math.sqrt(Math.pow(action.x - action.startX, 2) + Math.pow(action.y - action.startY, 2));
             ctx.beginPath();
-            ctx.arc(action.startX, action.startY, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = actionColor;
+            ctx.lineWidth = actionWidth;
+            ctx.arc(action.startX, action.startY, radius, 0, 2 * Math.PI);
             ctx.stroke();
             break;
+            
         case 'fill':
-            if (action.startX >= 0 && action.startX < canvas.width &&
-                action.startY >= 0 && action.startY < canvas.height) {
-                floodFill(Math.floor(action.startX), Math.floor(action.startY), action.color);
-            }
+            ctx.fillStyle = actionColor;
+            floodFill(action.startX, action.startY, actionColor);
             break;
+            
         case 'spray':
-            const sprayRadius = action.lineWidth * 2; // Spray radius based on line width
-            const density = action.lineWidth * 2;     // Number of dots to spray
-            sprayPaint(action.x, action.y, sprayRadius, density, action.color);
+            ctx.fillStyle = actionColor;
+            sprayPaint(action.x, action.y, actionWidth * 2, actionWidth * 5, actionColor);
+            break;
+            
+        case 'eraser':
+            ctx.beginPath();
+            ctx.strokeStyle = '#FFFFFF'; // White for eraser
+            ctx.lineWidth = actionWidth;
+            ctx.lineCap = 'round';
+            ctx.moveTo(action.startX, action.startY);
+            ctx.lineTo(action.x, action.y);
+            ctx.stroke();
             break;
     }
-
-    ctx.restore();
     
-    // Store the action
-    drawingActions.push(action);
+    // After drawing, save the canvas state for periodic updates
+    lastDrawingState = canvas.toDataURL();
 }
 
 function stopDrawing() {
@@ -393,27 +624,39 @@ sendPromptButton.addEventListener('click', () => {
     aiPrompt.disabled = true;
     sendPromptButton.disabled = true;
 
-    // Show drawing status
-    showDrawingStatus('AI starting to draw in Phase 1...');
-    
-    // Reset any previous progress
-    const progressContainer = document.getElementById('progressContainer');
-    if (progressContainer) {
-        progressContainer.style.display = 'none';
+    // Show drawing status based on mode
+    if (streamingMode) {
+        showDrawingStatus('AI starting to draw in streaming mode...');
+        
+        // For streaming mode, we don't show phase transitions
+        const progressContainer = document.getElementById('progressContainer');
+        if (progressContainer) {
+            progressContainer.style.display = 'none';
+        }
+    } else {
+        // For batch mode, show phase information
+        showDrawingStatus('AI starting to draw in Phase 1...');
+        
+        // Reset any previous progress
+        const progressContainer = document.getElementById('progressContainer');
+        if (progressContainer) {
+            progressContainer.style.display = 'none';
+        }
+        
+        // Show initial phase information
+        showPhaseTransition(1);
+        
+        // Initialize progress with Phase 1
+        setTimeout(() => {
+            updateCompletionProgress(0, 1);
+        }, 1000);
     }
     
-    // Show initial phase information
-    showPhaseTransition(1);
-    
-    // Initialize progress with Phase 1
-    setTimeout(() => {
-        updateCompletionProgress(0, 1);
-    }, 1000);
-    
-    // Send prompt to server
+    // Send prompt to server, indicating if we're in streaming mode
     ws.send(JSON.stringify({
         type: 'AI_PROMPT',
-        prompt: prompt
+        prompt: prompt,
+        streamingMode: streamingMode
     }));
 
     // Clear prompt
@@ -422,6 +665,12 @@ sendPromptButton.addEventListener('click', () => {
 
 // Function to send canvas state to server
 function sendCanvasState() {
+    // Don't send if already processing to prevent feedback loops
+    if (streamingMode && isProcessingStreamingCommand) {
+        console.log('Skipping canvas update while command is processing');
+        return;
+    }
+    
     const canvasData = canvas.toDataURL();
     ws.send(JSON.stringify({
         type: 'CANVAS_UPDATE',
@@ -686,4 +935,30 @@ function colorsMatchWithTolerance(r1, g1, b1, a1, r2, g2, b2, a2, tolerance) {
            Math.abs(g1 - g2) <= tolerance &&
            Math.abs(b1 - b2) <= tolerance &&
            Math.abs(a1 - a2) <= tolerance;
-} 
+}
+
+// Add some CSS for streaming mode
+const streamingStyleSheet = document.createElement('style');
+streamingStyleSheet.textContent = `
+    .streaming-controls {
+        margin-top: 15px;
+        border-top: 1px solid #ddd;
+        padding-top: 10px;
+    }
+    
+    .streaming-options {
+        margin-top: 8px;
+        font-size: 0.9em;
+        padding-left: 10px;
+    }
+    
+    .streaming-active {
+        border-color: #4CAF50 !important;
+        box-shadow: 0 0 5px rgba(76, 175, 80, 0.5) !important;
+    }
+    
+    #streamingStatus {
+        background: rgba(76, 175, 80, 0.8) !important;
+    }
+`;
+document.head.appendChild(streamingStyleSheet); 

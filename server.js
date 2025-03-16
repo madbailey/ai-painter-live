@@ -4,7 +4,7 @@ const WebSocket = require('ws');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
-const { processUserPrompt, clearConversation, continueDrawing } = require('./services/gemini');
+const { processUserPrompt, clearConversation, continueDrawing, streamingModeUpdate, toggleStreamingMode, setStreamingBatchSize } = require('./services/gemini');
 
 const app = express();
 const server = http.createServer(app);
@@ -31,6 +31,10 @@ const clientTimingMetrics = new Map();
 // Add a tracker for the current drawing phase
 let currentDrawingPhase = 1;
 
+// Add streaming mode state tracking
+let streamingModeEnabled = false;
+const DEFAULT_STREAMING_INTERVAL = 300; // 300ms between canvas updates in streaming mode
+
 // WebSocket connection handling
 wss.on('connection', (ws) => {
     console.log('\n🔌 New client connected');
@@ -40,28 +44,85 @@ wss.on('connection', (ws) => {
     // Initialize client state
     ws.originalPrompt = null;
     ws.currentPhase = 1;
+    ws.streamingMode = false;
+    ws.lastCanvasUpdate = Date.now();
+    ws.streamingInterval = DEFAULT_STREAMING_INTERVAL;
+    
+    // Setup heartbeat for connection stability (do this only once per connection)
+    if (!ws.heartbeatSetup) {
+        ws.isAlive = true;
+        
+        // Remove any existing pong listeners if they exist
+        ws.removeAllListeners('pong');
+        
+        ws.on('pong', () => {
+            ws.isAlive = true;
+        });
+        ws.heartbeatSetup = true;
+    }
 
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
             console.log('\n📩 Received WebSocket message:', data.type);
 
-            if (data.type === 'CANVAS_UPDATE') {
-                const now = Date.now();
-                
-                // Check if we should process this update (throttle)
-                if (now - ws.lastCanvasUpdate >= ws.streamingInterval) {
-                    ws.lastCanvasUpdate = now;
-                    
+            // Reset error count on successful message
+            consecutiveErrors = 0;
+
+            // Process the message based on its type
+            switch (data.type) {
+                case 'CANVAS_UPDATE':
                     console.log('Processing canvas update...');
+                    const now = Date.now();
+                    
+                    // Store current canvas state
                     canvasState = data.canvasData;
                     
                     // Store canvas timestamp for timing diagnostics
-                    canvasStateTimestamp = now;
+                    const canvasStateTimestamp = now;
                     
-                    // Process canvas with AI if in live analysis mode
-                    if (ws.liveAnalysisMode) {
-                        processCanvasWithAI(canvasState, ws);
+                    // Check if we should process this update (throttle)
+                    if (now - ws.lastCanvasUpdate >= ws.streamingInterval) {
+                        ws.lastCanvasUpdate = now;
+                        
+                        // Process canvas with AI if in streaming mode
+                        if (ws.streamingMode && ws.originalPrompt) {
+                            // Notify client we're starting command execution
+                            ws.send(JSON.stringify({
+                                type: 'STREAMING_COMMAND_START'
+                            }));
+                            
+                            const streamingCommands = await streamingModeUpdate(
+                                canvasState, 
+                                ws.originalPrompt, 
+                                ws.currentPhase
+                            );
+                            
+                            if (streamingCommands && streamingCommands.length > 0) {
+                                console.log(`Executing ${streamingCommands.length} streaming commands`);
+                                await executeCommands(streamingCommands, ws);
+                                
+                                // Notify client that command execution is complete
+                                ws.send(JSON.stringify({
+                                    type: 'STREAMING_COMMAND_COMPLETE'
+                                }));
+                            } else {
+                                console.log('No streaming commands received or drawing complete');
+                                // If no commands returned, the drawing might be complete
+                                ws.streamingMode = false;
+                                ws.send(JSON.stringify({
+                                    type: 'STREAMING_COMPLETE'
+                                }));
+                            }
+                        }
+                        
+                        // Process canvas with AI if in live analysis mode
+                        if (ws.liveAnalysisMode) {
+                            processCanvasWithAI(canvasState, ws);
+                        }
+                    } else {
+                        // Too frequent updates, skip this one
+                        console.log('Skipping canvas update due to throttling');
                     }
                     
                     // Broadcast to other clients
@@ -70,39 +131,7 @@ wss.on('connection', (ws) => {
                         canvasData: canvasState,
                         timestamp: now
                     });
-                }
-            }
-
-                    // Setup heartbeat for connection stability
-            ws.isAlive = true;
-            ws.on('pong', () => {
-                ws.isAlive = true;
-            });
-            
-            // Add canvas streaming rate control
-            ws.lastCanvasUpdate = Date.now();
-            ws.streamingInterval = 500; // ms between canvas updates (can be adjusted dynamically) // Setup heartbeat for connection stability
-            ws.isAlive = true;
-            ws.on('pong', () => {
-                ws.isAlive = true;
-            });
-            
-            // Add canvas streaming rate control
-            ws.lastCanvasUpdate = Date.now();
-            ws.streamingInterval = 500; // ms between canvas updates (can be adjusted dynamically)
-
-            //reset error count on successful message
-            consecutiveErrors = 0;
-            
-            switch (data.type) {
-                case 'CANVAS_UPDATE':
-                    console.log('Updating canvas state...');
-                    canvasState = data.canvasData;
-                    // Broadcast to all other clients
-                    broadcastToOthers(ws, {
-                        type: 'CANVAS_UPDATE',
-                        canvasData: canvasState
-                    });
+                    
                     console.log('Canvas state updated and broadcasted');
                     break;
 
@@ -117,17 +146,37 @@ wss.on('connection', (ws) => {
 
                 case 'AI_PROMPT':
                     console.log('\n🤖 Processing AI prompt:', data.prompt);
-                    // Store the original prompt for continuation
+                    // Store the original prompt for continuation or streaming
                     ws.originalPrompt = data.prompt;
                     // Reset phase to 1 for new drawings
                     ws.currentPhase = 1;
                     currentDrawingPhase = 1;
-                    // Process AI prompt and execute commands
-                    const commands = await processUserPrompt(data.prompt, canvasState);
-                    console.log('AI returned commands:', commands.length);
                     
-                    await executeCommands(commands, ws);
-                    console.log('Finished executing AI commands');
+                    // If streaming mode is active, handle differently
+                    if (data.streamingMode) {
+                        console.log('Starting streaming mode drawing session');
+                        // Enable streaming mode for this client
+                        ws.streamingMode = true;
+                        toggleStreamingMode(true);
+                        
+                        // Send initial status to client
+                        ws.send(JSON.stringify({
+                            type: 'STREAMING_MODE_STARTED',
+                            prompt: data.prompt
+                        }));
+                        
+                        // Request an immediate canvas update to start the process
+                        ws.send(JSON.stringify({
+                            type: 'REQUEST_CANVAS_UPDATE'
+                        }));
+                    } else {
+                        // Process AI prompt in batch mode (existing behavior)
+                        const commands = await processUserPrompt(data.prompt, canvasState);
+                        console.log('AI returned commands:', commands.length);
+                        
+                        await executeCommands(commands, ws);
+                        console.log('Finished executing AI commands');
+                    }
                     break;
 
                 case 'CONTINUE_DRAWING':
@@ -136,21 +185,60 @@ wss.on('connection', (ws) => {
                         ws.originalPrompt = "the current drawing";
                     }
                     
-                    // Request additional drawing commands
-                    const continuationCommands = await continueDrawing(canvasState, ws.originalPrompt, ws.currentPhase);
-                    console.log('AI returned continuation commands:', continuationCommands.length);
-                    
-                    if (continuationCommands.length > 0) {
-                        await executeCommands(continuationCommands, ws);
-                        console.log('Finished executing continuation commands');
-                    } else {
-                        console.log('No continuation commands - drawing may be complete');
+                    // If in streaming mode, just request a canvas update
+                    if (ws.streamingMode) {
+                        console.log('Continuing in streaming mode');
                         ws.send(JSON.stringify({
-                            type: 'DRAWING_COMPLETE'
+                            type: 'REQUEST_CANVAS_UPDATE'
                         }));
+                    } else {
+                        // Request additional drawing commands (batch mode)
+                        const continuationCommands = await continueDrawing(
+                            canvasState, 
+                            ws.originalPrompt, 
+                            ws.currentPhase
+                        );
+                        console.log('AI returned continuation commands:', continuationCommands.length);
+                        
+                        if (continuationCommands.length > 0) {
+                            await executeCommands(continuationCommands, ws);
+                            console.log('Finished executing continuation commands');
+                        } else {
+                            console.log('No continuation commands - drawing may be complete');
+                            ws.send(JSON.stringify({
+                                type: 'DRAWING_COMPLETE'
+                            }));
+                        }
                     }
                     break;
+                    
+                case 'TOGGLE_STREAMING_MODE':
+                    console.log('\n🔄 Toggling streaming mode:', data.enabled);
+                    ws.streamingMode = data.enabled;
+                    toggleStreamingMode(data.enabled);
+                    
+                    // Update streaming interval if provided
+                    if (data.interval) {
+                        ws.streamingInterval = Math.max(100, Math.min(2000, data.interval));
+                        console.log('Streaming interval set to', ws.streamingInterval, 'ms');
+                    }
+                    
+                    // Update batch size if provided
+                    if (data.batchSize) {
+                        setStreamingBatchSize(data.batchSize);
+                    }
+                    
+                    ws.send(JSON.stringify({
+                        type: 'STREAMING_MODE_UPDATE',
+                        enabled: ws.streamingMode,
+                        interval: ws.streamingInterval
+                    }));
+                    break;
             }
+
+            // Update the last canvas update time
+            ws.lastCanvasUpdate = Date.now();
+
         } catch (error) {
             consecutiveErrors++;
             console.error('\n❌ Error processing message:', error.message);
@@ -175,22 +263,22 @@ wss.on('connection', (ws) => {
         }
     });
 
-    const interval = setInterval(() => {
-        wss.clients.forEach((ws) => {
-            if (ws.isAlive === false) {
-                connectedClients.delete(ws);
-                return ws.terminate();
-            }
-            
-            ws.isAlive = false;
-            ws.ping();
-        });
-    }, HEARTBEAT_INTERVAL);
-
     ws.on('close', () => {
         console.log('\n🔌 Client disconnected');
         connectedClients.delete(ws);
+        
+        // Clean up any event listeners
+        ws.removeAllListeners();
+        
         console.log('Remaining connected clients:', connectedClients.size);
+    });
+
+    ws.on('error', (error) => {
+        console.error('\n❌ WebSocket error:', error);
+        connectedClients.delete(ws);
+        
+        // Clean up any event listeners
+        ws.removeAllListeners();
     });
 
     // Send current canvas state to new client
@@ -203,6 +291,24 @@ wss.on('connection', (ws) => {
     }
 });
 
+// Set up the heartbeat interval only once
+const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            connectedClients.delete(ws);
+            ws.removeAllListeners(); // Clean up event listeners
+            return ws.terminate();
+        }
+        
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, HEARTBEAT_INTERVAL);
+
+// Clean up the interval on server close
+wss.on('close', () => {
+    clearInterval(heartbeatInterval);
+});
 
 async function processCanvasWithAI(canvasState, ws) {
     // Skip if we processed a canvas too recently
@@ -419,6 +525,46 @@ app.post('/api/linewidth', (req, res) => {
     res.json({ success: true });
 });
 
+// Add new API endpoint for streaming mode
+app.post('/api/streaming-mode', (req, res) => {
+    console.log('\n🌊 POST /api/streaming-mode');
+    console.log('Streaming mode:', req.body);
+    
+    const { enabled, interval, batchSize } = req.body;
+    
+    // Enable/disable streaming mode globally
+    streamingModeEnabled = enabled;
+    
+    // Set batch size if provided
+    if (batchSize) {
+        setStreamingBatchSize(batchSize);
+    }
+    
+    // Broadcast to all clients
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.streamingMode = enabled;
+            
+            // Update interval if provided
+            if (interval) {
+                client.streamingInterval = Math.max(100, Math.min(2000, interval));
+            }
+            
+            client.send(JSON.stringify({
+                type: 'STREAMING_MODE_UPDATE',
+                enabled: enabled,
+                interval: client.streamingInterval
+            }));
+        }
+    });
+
+    res.json({ 
+        success: true, 
+        enabled: streamingModeEnabled,
+        batchSize: batchSize || 3
+    });
+});
+
 // Helper function to execute drawing commands
 async function executeCommands(commands, ws) {
     // Track if we need to continue drawing
@@ -426,9 +572,11 @@ async function executeCommands(commands, ws) {
     let completionPercentage = 0;
     let phaseChange = false;
     
+    console.log(`Executing ${commands.length} commands...`);
+    
     for (const command of commands) {
         if (command.endpoint && command.params) {
-            console.log('Executing command:', command.endpoint);
+            console.log('Executing command:', command.endpoint, JSON.stringify(command.params));
             
             // Check if this is a next_phase command
             if (command.endpoint === '/api/next_phase') {
@@ -530,9 +678,46 @@ async function executeCommands(commands, ws) {
                             break;
                         case '/api/draw':
                             messageType = 'DRAW_ACTION';
+                            // Validate that the draw params have all required fields
+                            const drawParams = {...command.params};
+                            
+                            // Add missing parameters with defaults if needed
+                            if (!drawParams.tool) drawParams.tool = 'pencil';
+                            if (!drawParams.color) drawParams.color = '#000000';
+                            if (!drawParams.lineWidth) drawParams.lineWidth = 2;
+                            if (drawParams.startX === undefined) drawParams.startX = 400;
+                            if (drawParams.startY === undefined) drawParams.startY = 300;
+                            if (drawParams.x === undefined) drawParams.x = 450; 
+                            if (drawParams.y === undefined) drawParams.y = 350;
+                            
+                            // Ensure coordinates are within canvas bounds
+                            drawParams.startX = Math.max(0, Math.min(800, drawParams.startX));
+                            drawParams.startY = Math.max(0, Math.min(600, drawParams.startY));
+                            drawParams.x = Math.max(0, Math.min(800, drawParams.x));
+                            drawParams.y = Math.max(0, Math.min(600, drawParams.y));
+                            
+                            // Ensure hex color is valid
+                            if (!drawParams.color.startsWith('#')) {
+                                drawParams.color = '#' + drawParams.color;
+                            }
+                            if (drawParams.color.length === 4) { // #RGB format
+                                const r = drawParams.color[1];
+                                const g = drawParams.color[2];
+                                const b = drawParams.color[3];
+                                drawParams.color = `#${r}${r}${g}${g}${b}${b}`;
+                            }
+                            if (drawParams.color.length !== 7) { // Invalid hex
+                                drawParams.color = '#000000'; 
+                            }
+                            
+                            // Ensure lineWidth is valid
+                            drawParams.lineWidth = Math.max(1, Math.min(50, drawParams.lineWidth));
+                            
+                            console.log('Validated draw params:', drawParams);
+                            
                             client.send(JSON.stringify({ 
                                 type: messageType,
-                                action: command.params 
+                                action: drawParams
                             }));
                             break;
                         case '/api/pause':
@@ -584,6 +769,7 @@ async function executeCommands(commands, ws) {
             }
         }
     }
+    console.log('Command execution complete');
 }
 
 const PORT = process.env.PORT || 3000;
