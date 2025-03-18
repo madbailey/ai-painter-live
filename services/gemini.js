@@ -136,57 +136,40 @@ PHASE 3 - Details & Refinement (71-100%):
 IMPORTANT: Respond ONLY with a JSON array of commands. Do not include any explanation text, markdown formatting, or backticks.`;
 
 // Modified system prompt with streaming mode instructions
-const streamingSystemPrompt = `You are an AI artist assistant that controls a canvas drawing application in STREAMING MODE. Your responses must be PURE JSON ARRAYS of 2-3 drawing commands at a time (no markdown formatting, no backticks).
+const streamingSystemPrompt = `You are a digital artist that creates drawings based on user prompts. In streaming mode, you provide 2-3 drawing commands at a time as a JSON array.
 
-In streaming mode, you receive frequent canvas updates and should make small, incremental adjustments based on what you see. Instead of planning the entire drawing at once, focus on the NEXT 2-3 ACTIONS to improve the current state.
+IMPORTANT: Focus on creating a clear, recognizable drawing that matches the user's prompt. Each command should make meaningful progress toward the final image.
 
-First, briefly describe what you see on the canvas. Then, provide ONLY 2-3 drawing commands to incrementally improve it based on the user's original prompt and current state.
+Always include ALL parameters in your drawing commands:
+- tool: which tool to use (pencil, brush, rectangle, circle, fill, spray, eraser)
+- color: hex color code (e.g., "#FF0000" for red)
+- lineWidth: thickness of lines (usually 2-10 for good visibility)
+- startX, startY: starting coordinates
+- x, y: ending coordinates
 
-EXTREMELY IMPORTANT: EVERY drawing command MUST include ALL required parameters:
-- tool: the tool to use (pencil, brush, rectangle, circle, fill, spray, eraser)
-- color: a valid hex color code (e.g., "#FF0000" for red)
-- lineWidth: a number for line thickness
-- startX and startY: coordinates where the action begins
-- x and y: coordinates where the action ends
+Canvas is 800x600 pixels.
 
 Available commands:
+1. Draw: { "endpoint": "/api/draw", "params": { "tool": "pencil|brush|rectangle|circle|fill|spray|eraser", "color": "#RRGGBB", "lineWidth": number, "startX": number, "startY": number, "x": number, "y": number }}
+2. Change tool: { "endpoint": "/api/tool", "params": { "tool": "pencil|brush|rectangle|circle|fill|spray|eraser" }}
+3. Change color: { "endpoint": "/api/color", "params": { "color": "#RRGGBB" }}
+4. Change line width: { "endpoint": "/api/linewidth", "params": { "width": number }}
+5. Pause: { "endpoint": "/api/pause", "params": { "duration": 1000 }}
 
-1. Draw lines and shapes:
-{ "endpoint": "/api/draw", "params": { "tool": "pencil|brush|rectangle|circle|fill|spray|eraser", "color": "#RRGGBB", "lineWidth": number, "startX": number, "startY": number, "x": number, "y": number }}
-
-2. Change tools:
-{ "endpoint": "/api/tool", "params": { "tool": "pencil|brush|rectangle|circle|fill|spray|eraser" }}
-
-3. Change colors:
-{ "endpoint": "/api/color", "params": { "color": "#RRGGBB" }}
-
-4. Change line width:
-{ "endpoint": "/api/linewidth", "params": { "width": number }}
-
-5. Clear canvas:
-{ "endpoint": "/api/clear" }
-
-6. Pause to analyze the canvas (will trigger a new canvas state capture):
-{ "endpoint": "/api/pause", "params": { "duration": 1000 }}
-
-7. Continue drawing with more commands and update progress:
-{ "endpoint": "/api/continue", "params": { "completionPercentage": number, "currentPhase": 1|2|3 }}
-
-The canvas size is 800x600 pixels. Use these coordinate ranges for your drawing commands:
-- startX and x: values between 0 and 800
-- startY and y: values between 0 and 600
-
-IMPORTANT STREAMING GUIDELINES:
+STREAMING GUIDELINES:
 1. Provide ONLY 2-3 commands per response
-2. EVERY /api/draw command MUST include ALL parameters (tool, color, lineWidth, startX, startY, x, y)
-3. Each command should make a visible, meaningful change to the canvas
-4. Always focus on the most important next steps based on canvas analysis
-5. Maintain artistic context between updates (remember what you were drawing)
-6. Always end with a pause command to trigger next canvas update
+2. Use shapes and lines that directly relate to the user's prompt
+3. Build the drawing logically, step by step
+4. Always end with a pause command
+5. Maintain spatial relationships between elements
+6. NEVER use random coordinates - always draw something relevant to the prompt
+7. Make steady, visible progress toward the intended image
 
-Remember: In streaming mode, you'll receive frequent updates and should make small, iterative improvements rather than trying to complete the entire drawing at once.
-
-IMPORTANT: Respond ONLY with a JSON array of 2-3 commands. Do not include any explanation text, markdown formatting, or backticks.`;
+CONSTRAINTS:
+1. All coordinates must be within 800x600 bounds
+2. Follow a logical drawing sequence: structure → filling → details
+3. Use colors appropriate to the subject
+4. Maintain consistent proportions and perspective`;
 
 async function processUserPrompt(prompt, canvasState) {
     console.log('\n=== Processing New AI Request ===');
@@ -293,7 +276,7 @@ function clearConversation() {
     conversationHistory = [];
 }
 
-async function analyzeLiveCanvas(canvasState, previousAnalysis = null) {
+async function analyzeLiveCanvas(canvasState, previousAnalysis = null, originalPrompt = null) {
     console.log('\n=== Processing Live Canvas Analysis ===');
     
     try {
@@ -314,9 +297,10 @@ async function analyzeLiveCanvas(canvasState, previousAnalysis = null) {
         
         // Special prompt for live analysis mode
         const liveAnalysisPrompt = `
-            Analyze this canvas and provide a detailed assessment.
-            Describe what you see and evaluate how complete the drawing is.
-            Identify what elements are missing or could be improved.
+            Analyze this canvas in relation to the prompt: "${originalPrompt || 'unknown subject'}"
+            Provide a detailed assessment of what's currently drawn and what's still needed.
+            Describe what you see and evaluate how complete the drawing is relative to the requested prompt.
+            Identify what elements are missing or could be improved to better match the prompt.
             
             Format your response as JSON:
             {
@@ -505,15 +489,13 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
     console.log('Original prompt:', originalPrompt);
     console.log('Current phase:', currentPhase);
     
-    const now = Date.now();
+    // Remove the throttling mechanism - we'd rather have slower commands than no commands
+    // if (now - lastStreamingUpdateTime < minStreamingUpdateInterval) {
+    //     console.log(`Throttling streaming update: ${now - lastStreamingUpdateTime}ms since last update`);
+    //     return [{ "endpoint": "/api/pause", "params": { "duration": 1000 }}];
+    // }
     
-    // Throttle requests to prevent feedback loops
-    if (now - lastStreamingUpdateTime < minStreamingUpdateInterval) {
-        console.log(`Throttling streaming update: ${now - lastStreamingUpdateTime}ms since last update`);
-        return [{ "endpoint": "/api/pause", "params": { "duration": 1000 }}];
-    }
-    
-    lastStreamingUpdateTime = now;
+    lastStreamingUpdateTime = Date.now();
     
     if (!streamingModeActive) {
         console.log('Streaming mode not active, activating now');
@@ -527,31 +509,22 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
         
         // First analyze the current canvas state
-        const analysis = await analyzeLiveCanvas(canvasState);
+        const analysis = await analyzeLiveCanvas(canvasState, lastCanvasAnalysis, originalPrompt);
         if (!analysis) {
             console.error('Failed to analyze canvas state');
-            // Return basic commands to draw something if analysis fails
-            return getEmergencyDrawingCommands(currentPhase);
+            // Return simple drawing command instead of empty array
+            return getEmergencyDrawCommand(currentPhase, originalPrompt);
         }
         
-        // Check if the canvas has changed significantly since last analysis
-        let significantChange = true;
-        if (lastCanvasAnalysis) {
-            // Compare completion percentage - if it's very close, might not need new commands
-            if (Math.abs(lastCanvasAnalysis.completionPercentage - analysis.completionPercentage) < 1) {
-                console.log('Canvas has not changed significantly since last update');
-                significantChange = false;
-            }
-        }
-        
-        // If no significant changes, return a simple command to show progress
-        if (!significantChange) {
-            console.log('Making a small change to show progress');
-            return getSimpleProgressCommands(currentPhase);
-        }
-        
+        // Save the current analysis regardless of changes
         lastCanvasAnalysis = analysis;
         console.log('Canvas analysis:', JSON.stringify(analysis, null, 2));
+        
+        // Remove the significant change check - we want drawing commands every time
+        // if (!significantChange) {
+        //     console.log('No significant changes detected - returning pause command only');
+        //     return [{ "endpoint": "/api/pause", "params": { "duration": 1000 }}];
+        // }
         
         // If drawing is already complete, stop streaming
         if (analysis.completionPercentage >= 95) {
@@ -566,22 +539,28 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         // Get phase-specific context
         const phaseInstructions = getPhaseInstructions(currentPhase);
         
-        // Prepare a special streaming prompt
+        // Prepare a special streaming prompt that emphasizes action
         const streamingPrompt = `
-            I'm drawing: "${originalPrompt || 'unknown subject'}" in streaming mode.
+            I need to draw: "${originalPrompt}" in streaming mode.
             
             Current canvas state (${analysis.completionPercentage}% complete):
             ${analysis.analysis}
             
-            Current phase context: Phase ${currentPhase} - ${phaseInstructions.name}
+            Current phase: Phase ${currentPhase} - ${phaseInstructions.name}
             
-            Provide EXACTLY 2-3 drawing commands that will make a VISIBLE and MEANINGFUL change to the canvas.
-            Focus on: ${analysis.suggestions?.slice(0, 2).join(', ') || 'improving the composition'}
+            YOU MUST provide EXACTLY 2-3 drawing commands that will make VISIBLE changes to the canvas.
+            Focus on: ${analysis.suggestions?.slice(0, 2).join(', ') || 'creating recognizable elements that match the prompt'}
             
-            IMPORTANT: EVERY /api/draw command MUST include ALL parameters: tool, color, lineWidth, startX, startY, x, y
-            The startX, startY, x, y coordinates must be within the canvas size (800x600 pixels)
+            IMPORTANT RULES:
+            1. YOU MUST provide at least one /api/draw command in your response
+            2. EVERY command MUST include ALL parameters
+            3. Each command must create something directly related to the prompt
+            4. YOUR RESPONSE WILL BE REJECTED if it does not include at least one drawing command
             
-            Remember to maintain artistic context between updates and end with a pause command.
+            DO NOT waste time with tool changes unless absolutely necessary.
+            Remember to end with a pause command.
+            
+            The user prompt is: "${originalPrompt}"
         `;
         
         console.log('Streaming prompt prepared');
@@ -613,8 +592,8 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         const result = await model.generateContent({
             contents: [{ parts }],
             generationConfig: {
-                temperature: 0.5, // Lower temperature for more consistent results
-                maxOutputTokens: 1024, // Smaller token limit for faster responses
+                temperature: 0.7, // Higher temperature for more creativity
+                maxOutputTokens: 1024,
                 topP: 0.9,
                 topK: 40
             }
@@ -635,64 +614,103 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
             // Ensure we don't exceed batch size
             const batchedCommands = commands.slice(0, streamingBatchSize);
             
-            // Verify that each draw command has all required parameters
-            const validatedCommands = batchedCommands.map(command => {
-                // If it's a draw command, ensure it has all needed parameters
-                if (command.endpoint === '/api/draw') {
-                    const params = command.params || {};
-                    
-                    // Check if any essential parameter is missing
-                    if (!params.tool || !params.color || !params.lineWidth || 
-                        params.startX === undefined || params.startY === undefined || 
-                        params.x === undefined || params.y === undefined) {
-                        
-                        console.log('Invalid draw command, missing parameters:', command);
-                        
-                        // Add any missing parameters with defaults
-                        return {
-                            endpoint: '/api/draw',
-                            params: {
-                                tool: params.tool || 'pencil',
-                                color: params.color || '#000000',
-                                lineWidth: params.lineWidth || 2,
-                                startX: params.startX !== undefined ? params.startX : 400,
-                                startY: params.startY !== undefined ? params.startY : 300,
-                                x: params.x !== undefined ? params.x : 450,
-                                y: params.y !== undefined ? params.y : 350
-                            }
-                        };
-                    }
-                }
-                return command;
-            });
+            // Validate that the commands include at least one draw command
+            let hasDrawCommand = batchedCommands.some(cmd => cmd.endpoint === '/api/draw');
+            
+            // If no draw commands, return emergency draw commands
+            if (!hasDrawCommand) {
+                console.log('No draw commands received, using emergency commands');
+                return getEmergencyDrawCommand(currentPhase, originalPrompt);
+            }
             
             // Make sure we end with a pause to trigger the next update
-            if (validatedCommands.length > 0 && 
-                (validatedCommands[validatedCommands.length - 1].endpoint !== '/api/pause')) {
-                validatedCommands.push({
+            if (batchedCommands.length > 0 && 
+                (batchedCommands[batchedCommands.length - 1].endpoint !== '/api/pause')) {
+                batchedCommands.push({
                     "endpoint": "/api/pause", 
                     "params": {"duration": 1000}
                 });
             }
             
-            console.log('Streaming batch commands:', validatedCommands.length);
-            
-            // Add fallback for empty commands
-            if (!commands || commands.length === 0) {
-                console.log('No commands received, using fallback drawing commands');
-                return getEmergencyDrawingCommands(currentPhase);
-            }
-            
-            return validatedCommands;
+            console.log('Streaming batch commands:', batchedCommands.length);
+            return batchedCommands;
         } catch (error) {
-            console.error('Failed to parse streaming commands:', error);
-            return getEmergencyDrawingCommands(currentPhase);
+            console.error('FAILURE: Failed to parse streaming commands:', error);
+            return getEmergencyDrawCommand(currentPhase, originalPrompt);
         }
     } catch (error) {
-        console.error('Error in streaming mode update:', error);
-        return getEmergencyDrawingCommands(currentPhase);
+        console.error('FAILURE: Error in streaming mode update:', error);
+        return getEmergencyDrawCommand(currentPhase, originalPrompt);
     } finally {
         console.log('=== Streaming Update Complete ===\n');
+    }
+}
+
+// New helper function that returns emergency drawing commands
+function getEmergencyDrawCommand(phase, prompt) {
+    // Always provide at least one drawing command based on the phase
+    console.log('Generating emergency drawing command');
+    
+    const canvas_width = 800;
+    const canvas_height = 600;
+    const centerX = canvas_width / 2;
+    const centerY = canvas_height / 2;
+    
+    // Generate a semi-random position that stays in center-ish region
+    const randomX = Math.floor(Math.random() * (canvas_width * 0.6) + canvas_width * 0.2);
+    const randomY = Math.floor(Math.random() * (canvas_height * 0.6) + canvas_height * 0.2);
+    
+    // Colors appropriate for beach scene
+    const beachColors = ['#F4A460', '#87CEEB', '#008080', '#FFD700', '#CD853F', '#000000'];
+    const randomColor = beachColors[Math.floor(Math.random() * beachColors.length)];
+    
+    switch(phase) {
+        case 1: // Outline phase - draw a simple shape
+            return [
+                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
+                { "endpoint": "/api/color", "params": { "color": "#000000" }},
+                { "endpoint": "/api/linewidth", "params": { "width": 2 }},
+                { "endpoint": "/api/draw", "params": { 
+                    "tool": "pencil", 
+                    "color": "#000000", 
+                    "lineWidth": 2, 
+                    "startX": randomX, 
+                    "startY": randomY, 
+                    "x": randomX + 50, 
+                    "y": randomY + 50 
+                }},
+                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
+            ];
+        case 2: // Coloring phase - add some color
+            return [
+                { "endpoint": "/api/tool", "params": { "tool": "fill" }},
+                { "endpoint": "/api/color", "params": { "color": randomColor }},
+                { "endpoint": "/api/draw", "params": { 
+                    "tool": "fill", 
+                    "color": randomColor, 
+                    "lineWidth": 1, 
+                    "startX": randomX, 
+                    "startY": randomY, 
+                    "x": randomX, 
+                    "y": randomY 
+                }},
+                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
+            ];
+        default: // Detail phase - add some details
+            return [
+                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
+                { "endpoint": "/api/color", "params": { "color": randomColor }},
+                { "endpoint": "/api/draw", "params": { 
+                    "tool": "pencil", 
+                    "color": randomColor, 
+                    "lineWidth": 3, 
+                    "startX": randomX, 
+                    "startY": randomY, 
+                    "x": randomX + 20, 
+                    "y": randomY + 20 
+                }},
+                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
+            ];
     }
 }
 
@@ -756,148 +774,6 @@ function getExampleCommandsForPhase(phase, prompt) {
                     "startY": 200, 
                     "x": 500, 
                     "y": 300 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-    }
-}
-
-// Helper function to provide emergency drawing commands when the AI fails
-function getEmergencyDrawingCommands(phase) {
-    console.log('Using emergency drawing commands for phase', phase);
-    
-    // Different commands based on the current phase
-    switch(phase) {
-        case 1: // Structure phase - draw a basic shape
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": "#000000" }},
-                { "endpoint": "/api/linewidth", "params": { "width": 2 }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": "#000000", 
-                    "lineWidth": 2, 
-                    "startX": 200 + Math.random() * 300, 
-                    "startY": 150 + Math.random() * 200, 
-                    "x": 300 + Math.random() * 200, 
-                    "y": 250 + Math.random() * 150 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        case 2: // Coloring phase - add some color
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "fill" }},
-                { "endpoint": "/api/color", "params": { "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0') }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "fill", 
-                    "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
-                    "lineWidth": 1, 
-                    "startX": 200 + Math.random() * 400, 
-                    "startY": 150 + Math.random() * 300, 
-                    "x": 300 + Math.random() * 200, 
-                    "y": 250 + Math.random() * 150 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        case 3: // Details phase - add some detail
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "spray" }},
-                { "endpoint": "/api/color", "params": { "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0') }},
-                { "endpoint": "/api/linewidth", "params": { "width": 5 }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "spray", 
-                    "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
-                    "lineWidth": 5, 
-                    "startX": 200 + Math.random() * 400, 
-                    "startY": 150 + Math.random() * 300, 
-                    "x": 300 + Math.random() * 200, 
-                    "y": 250 + Math.random() * 150 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        default:
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": "#000000" }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": "#000000", 
-                    "lineWidth": 2, 
-                    "startX": 200 + Math.random() * 400, 
-                    "startY": 150 + Math.random() * 300, 
-                    "x": 300 + Math.random() * 200, 
-                    "y": 250 + Math.random() * 150 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-    }
-}
-
-// Helper function to provide simple progress commands when changes are minimal
-function getSimpleProgressCommands(phase) {
-    console.log('Using simple progress commands for phase', phase);
-    
-    // Add a single small element to show progress is happening
-    switch(phase) {
-        case 1: // Structure phase - add a small line
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": "#000000" }},
-                { "endpoint": "/api/linewidth", "params": { "width": 1 }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": "#000000", 
-                    "lineWidth": 1, 
-                    "startX": 300 + Math.random() * 200, 
-                    "startY": 200 + Math.random() * 150, 
-                    "x": 320 + Math.random() * 150, 
-                    "y": 220 + Math.random() * 100 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        case 2: // Coloring phase - add a small color area
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "fill" }},
-                { "endpoint": "/api/color", "params": { "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0') }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "fill", 
-                    "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
-                    "lineWidth": 1, 
-                    "startX": 250 + Math.random() * 300, 
-                    "startY": 200 + Math.random() * 200, 
-                    "x": 250 + Math.random() * 300, 
-                    "y": 200 + Math.random() * 200 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        case 3: // Details phase - add a small detail
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "spray" }},
-                { "endpoint": "/api/color", "params": { "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0') }},
-                { "endpoint": "/api/linewidth", "params": { "width": 3 }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "spray", 
-                    "color": "#" + Math.floor(Math.random()*16777215).toString(16).padStart(6, '0'),
-                    "lineWidth": 3, 
-                    "startX": 250 + Math.random() * 300, 
-                    "startY": 200 + Math.random() * 200, 
-                    "x": 250 + Math.random() * 300, 
-                    "y": 200 + Math.random() * 200 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        default:
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": "#000000" }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": "#000000", 
-                    "lineWidth": 1, 
-                    "startX": 300 + Math.random() * 200, 
-                    "startY": 200 + Math.random() * 150, 
-                    "x": 320 + Math.random() * 150, 
-                    "y": 220 + Math.random() * 100 
                 }},
                 { "endpoint": "/api/pause", "params": { "duration": 1000 }}
             ];

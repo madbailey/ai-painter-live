@@ -20,6 +20,8 @@ let canvasUpdateInterval = null;
 let isProcessingStreamingCommand = false;
 let lastUpdateTimestamp = 0;
 let minUpdateInterval = 500;
+let lastServerRequestTime = 0;
+let isWaitingForServerResponse = false;
 
 // Tool elements
 const tools = document.querySelectorAll('.tool');
@@ -144,6 +146,9 @@ ctx.strokeStyle = colorPicker.value;
 ctx.lineWidth = lineWidthInput.value;
 ctx.lineCap = 'round';
 
+// Add near the top with other constants
+const VALID_TOOLS = ['pencil', 'brush', 'rectangle', 'circle', 'fill', 'spray', 'eraser'];
+
 // WebSocket event handlers
 ws.onopen = () => {
     console.log('Connected to server');
@@ -252,12 +257,9 @@ ws.onmessage = (event) => {
             const interval = parseInt(streamingInterval.value);
             lastUpdateTimestamp = Date.now();
             canvasUpdateInterval = setInterval(() => {
-                // Only send updates if not currently processing and enough time has passed
-                if (streamingMode && !isProcessingStreamingCommand && 
-                    (Date.now() - lastUpdateTimestamp >= minUpdateInterval)) {
-                    lastUpdateTimestamp = Date.now();
+                // Only send updates if not currently processing and not waiting for response
+                if (streamingMode && !isProcessingStreamingCommand && !isWaitingForServerResponse) {
                     sendCanvasState();
-                    console.log('Canvas state automatically updated');
                 }
             }, interval);
             break;
@@ -288,24 +290,17 @@ ws.onmessage = (event) => {
         case 'STREAMING_COMMAND_START':
             console.log('Server processing streaming command');
             isProcessingStreamingCommand = true;
-            // Add a visual indicator that commands are being processed
+            isWaitingForServerResponse = true;
             showDrawingStatus('Processing streaming commands...');
             break;
         
         case 'STREAMING_COMMAND_COMPLETE':
             console.log('Server completed streaming command batch');
             isProcessingStreamingCommand = false;
-            // Show that commands have been processed
+            isWaitingForServerResponse = false;
             showDrawingStatus('Drawing updated. Resuming streaming...');
-            // Allow a short delay before sending next update
-            setTimeout(() => {
-                lastUpdateTimestamp = Date.now() - minUpdateInterval;
-                // Explicitly send a canvas update to continue the streaming flow
-                if (streamingMode) {
-                    sendCanvasState();
-                    console.log('Sending canvas update after command completion');
-                }
-            }, 200);
+            // Reset the last update timestamp to allow immediate update
+            lastUpdateTimestamp = 0;
             break;
         
         default:
@@ -465,6 +460,21 @@ function draw(e) {
 }
 
 function executeDrawAction(action) {
+    // New validation checks
+    if (!action.tool || !VALID_TOOLS.includes(action.tool)) {
+        console.error('Invalid tool:', action.tool);
+        return;
+    }
+    
+    // Coordinate validation
+    const isValidCoordinate = (num, max) => 
+        typeof num === 'number' && num >= 0 && num <= max;
+    if (![action.startX, action.x].every(n => isValidCoordinate(n, 800)) ||
+        ![action.startY, action.y].every(n => isValidCoordinate(n, 600))) {
+        console.error('Invalid coordinates:', action);
+        return;
+    }
+    
     console.log('Executing draw action:', action);
     
     // Set tool, color, and line width based on the action
@@ -671,6 +681,24 @@ function sendCanvasState() {
         return;
     }
     
+    const now = Date.now();
+    
+    // Only throttle if we're in streaming mode
+    if (streamingMode) {
+        // If we're waiting for a server response, don't send updates
+        if (isWaitingForServerResponse) {
+            console.log('Skipping canvas update while waiting for server response');
+            return;
+        }
+        
+        // If we haven't waited long enough since last update
+        if (now - lastUpdateTimestamp < minUpdateInterval) {
+            console.log('Skipping canvas update due to throttling');
+            return;
+        }
+    }
+    
+    lastUpdateTimestamp = now;
     const canvasData = canvas.toDataURL();
     ws.send(JSON.stringify({
         type: 'CANVAS_UPDATE',
