@@ -22,6 +22,7 @@ let lastUpdateTimestamp = 0;
 let minUpdateInterval = 500;
 let lastServerRequestTime = 0;
 let isWaitingForServerResponse = false;
+let gridOverlayEnabled = true; // Enable grid by default when sending to AI
 
 // Tool elements
 const tools = document.querySelectorAll('.tool');
@@ -662,10 +663,21 @@ sendPromptButton.addEventListener('click', () => {
         }, 1000);
     }
     
+    // Add information about grid to the prompt if enabled
+    if (gridOverlayEnabled) {
+        const originalPrompt = prompt;
+        
+        // Append grid info to prompt
+        const promptWithGridInfo = originalPrompt + 
+            "\n\nNote: The image has a coordinate grid overlay to help you with spatial positioning. This grid is for reference only and not part of the actual drawing. Please use these coordinates when describing locations.";
+        
+        aiPrompt.value = promptWithGridInfo;
+    }
+    
     // Send prompt to server, indicating if we're in streaming mode
     ws.send(JSON.stringify({
         type: 'AI_PROMPT',
-        prompt: prompt,
+        prompt: aiPrompt.value.trim(),
         streamingMode: streamingMode
     }));
 
@@ -699,12 +711,114 @@ function sendCanvasState() {
     }
     
     lastUpdateTimestamp = now;
-    const canvasData = canvas.toDataURL();
+    
+    // Instead of sending the raw canvas, create a new canvas with grid overlay
+    let canvasData;
+    
+    if (gridOverlayEnabled) {
+        // Create temporary canvas with grid overlay
+        canvasData = createCanvasWithGridOverlay();
+    } else {
+        // Use normal canvas without grid
+        canvasData = canvas.toDataURL();
+    }
+    
     ws.send(JSON.stringify({
         type: 'CANVAS_UPDATE',
-        canvasData: canvasData
+        canvasData: canvasData,
+        hasGridOverlay: gridOverlayEnabled // Let the server know a grid is included
     }));
 }
+
+// Function to create canvas with grid overlay
+function createCanvasWithGridOverlay() {
+    // Create a temporary canvas
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    const tempCtx = tempCanvas.getContext('2d');
+    
+    // Draw the original canvas content
+    tempCtx.drawImage(canvas, 0, 0);
+    
+    // Add grid overlay
+    drawGrid(tempCtx, tempCanvas.width, tempCanvas.height);
+    
+    // Return the data URL of the temporary canvas
+    return tempCanvas.toDataURL();
+}
+
+// Function to draw grid overlay with coordinates
+function drawGrid(ctx, width, height) {
+    const gridSize = 50; // Size of grid cells in pixels
+    const gridColor = 'rgba(100, 100, 100, 0.3)'; // Semi-transparent gray
+    const labelColor = 'rgba(50, 50, 200, 0.7)'; // Semi-transparent blue for labels
+    const labelFont = '10px Arial';
+    
+    ctx.save();
+    
+    // Draw vertical lines with x-coordinates
+    for (let x = 0; x <= width; x += gridSize) {
+        // Draw line
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.strokeStyle = gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+        
+        // Add x-coordinate label at the top
+        if (x > 0) { // Skip label at x=0 to avoid overlap
+            ctx.fillStyle = labelColor;
+            ctx.font = labelFont;
+            ctx.fillText(x.toString(), x - 10, 10);
+        }
+    }
+    
+    // Draw horizontal lines with y-coordinates
+    for (let y = 0; y <= height; y += gridSize) {
+        // Draw line
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.strokeStyle = gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+        
+        // Add y-coordinate label on the left
+        if (y > 0) { // Skip label at y=0 to avoid overlap
+            ctx.fillStyle = labelColor;
+            ctx.font = labelFont;
+            ctx.fillText(y.toString(), 2, y + 4);
+        }
+    }
+    
+    // Add a legend explaining the grid
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(width - 200, height - 30, 195, 25);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+    ctx.font = '12px Arial';
+    ctx.fillText('Grid for AI reference only (not part of image)', width - 195, height - 15);
+    
+    ctx.restore();
+}
+
+// Add toggle control for grid overlay
+const gridControlHTML = `
+    <div class="control-group grid-controls">
+        <label for="gridOverlayCheckbox">Grid for AI</label>
+        <input type="checkbox" id="gridOverlayCheckbox" checked>
+    </div>
+`;
+document.querySelector('.streaming-controls').insertAdjacentHTML('beforeend', gridControlHTML);
+
+// Get reference to grid control
+const gridOverlayCheckbox = document.getElementById('gridOverlayCheckbox');
+
+// Add event listener for grid toggle
+gridOverlayCheckbox.addEventListener('change', (e) => {
+    gridOverlayEnabled = e.target.checked;
+});
 
 // Function to show drawing status
 function showDrawingStatus(message) {
