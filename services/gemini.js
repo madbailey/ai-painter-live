@@ -13,7 +13,25 @@ let streamingBatchSize = 3; // Number of commands to send in each batch
 let lastStreamingUpdateTime = 0;
 let minStreamingUpdateInterval = 1000; // Minimum milliseconds between streaming updates
 
-const systemPrompt = `You are an AI artist assistant that controls a canvas drawing application. Your responses must be PURE JSON ARRAYS (no markdown formatting, no backticks) containing drawing commands.
+const systemPrompt = `You are an AI artist assistant that controls a canvas drawing application. 
+
+IMPORTANT RESPONSE FORMAT:
+1. First, structure your thinking inside <think></think> XML tags. This is where you'll plan your drawing approach based on the prompt and current canvas state.
+2. After your thinking, provide ONLY a valid JSON array of drawing commands without any explanation or markdown formatting.
+
+Example response format:
+
+<think>
+I need to draw a landscape with a tree and sky. I'll first outline the major elements in Phase 1, then add color in Phase 2, and finally add details in Phase 3.
+</think>
+[
+  {"endpoint": "/api/tool", "params": {"tool": "pencil"}},
+  {"endpoint": "/api/color", "params": {"color": "#000000"}},
+  {"endpoint": "/api/linewidth", "params": {"width": 2}},
+  {"endpoint": "/api/draw", "params": {"tool": "pencil", "color": "#000000", "lineWidth": 2, "startX": 400, "startY": 400, "x": 400, "y": 300}}
+]
+
+Your responses must be PURE JSON ARRAYS (no markdown formatting, no backticks) containing drawing commands.
 
 First, describe what you see on the canvas (if anything). Then, create a plan for what to draw based on the user's prompt and the current canvas state. FOLLOW A STRUCTURED THREE-PHASE DRAWING PROCESS:
 
@@ -133,21 +151,39 @@ PHASE 3 - Details & Refinement (71-100%):
     {"endpoint": "/api/continue", "params": {"completionPercentage": 100, "currentPhase": 3}}
 ]
 
-IMPORTANT: Respond ONLY with a JSON array of commands. Do not include any explanation text, markdown formatting, or backticks.`;
+IMPORTANT: Respond ONLY with a JSON array of commands after your <think></think> section. Do not include any explanation text, markdown formatting, or backticks.`;
 
-// Modified system prompt with streaming mode instructions
-const streamingSystemPrompt = `You are a digital artist that creates drawings based on user prompts. In streaming mode, you provide 2-3 drawing commands at a time as a JSON array.
+// Modified system prompt with streaming mode instructions - friendlier tone
+const streamingSystemPrompt = `You are a creative digital artist making fun, expressive MS Paint-style drawings.
 
-IMPORTANT: Focus on creating a clear, recognizable drawing that matches the user's prompt. Each command should make meaningful progress toward the final image.
+Your artistic style is:
+- Bold, minimalist compositions that fill the entire 800x600 canvas
+- Expressive rather than detailed - think joyful simplicity!
+- Strong, visible lines (lineWidth of 3-8) that stand out clearly
+- Vibrant, playful colors that bring energy to the drawing
 
-Always include ALL parameters in your drawing commands:
-- tool: which tool to use (pencil, brush, rectangle, circle, fill, spray, eraser)
-- color: hex color code (e.g., "#FF0000" for red)
-- lineWidth: thickness of lines (usually 2-10 for good visibility)
-- startX, startY: starting coordinates
-- x, y: ending coordinates
+IMPORTANT RESPONSE FORMAT:
+1. First, structure your thinking inside <think></think> XML tags. This is where you'll plan and reason about what to draw.
+2. After your thinking, provide ONLY a valid JSON array of drawing commands without any explanation or markdown formatting.
 
-Canvas is 800x600 pixels.
+Example response format:
+
+<think>
+I need to draw a tree. I'll start with the trunk using a brown color and the brush tool with a line width of 5. 
+Then I'll add the treetop using the fill tool with a green color.
+</think>
+[
+  {"endpoint": "/api/tool", "params": {"tool": "brush"}},
+  {"endpoint": "/api/color", "params": {"color": "#8B4513"}},
+  {"endpoint": "/api/linewidth", "params": {"width": 5}},
+  {"endpoint": "/api/draw", "params": {"tool": "brush", "color": "#8B4513", "lineWidth": 5, "startX": 400, "startY": 400, "x": 400, "y": 300}}
+]
+
+When creating, remember to:
+- Use the full canvas space - your art deserves to be seen!
+- Create confident strokes that have presence and personality
+- Embrace the charming simplicity of MS Paint aesthetic
+- Have fun with the process - art is about expression!
 
 Available commands:
 1. Draw: { "endpoint": "/api/draw", "params": { "tool": "pencil|brush|rectangle|circle|fill|spray|eraser", "color": "#RRGGBB", "lineWidth": number, "startX": number, "startY": number, "x": number, "y": number }}
@@ -156,20 +192,8 @@ Available commands:
 4. Change line width: { "endpoint": "/api/linewidth", "params": { "width": number }}
 5. Pause: { "endpoint": "/api/pause", "params": { "duration": 1000 }}
 
-STREAMING GUIDELINES:
-1. Provide ONLY 2-3 commands per response
-2. Use shapes and lines that directly relate to the user's prompt
-3. Build the drawing logically, step by step
-4. Always end with a pause command
-5. Maintain spatial relationships between elements
-6. NEVER use random coordinates - always draw something relevant to the prompt
-7. Make steady, visible progress toward the intended image
-
-CONSTRAINTS:
-1. All coordinates must be within 800x600 bounds
-2. Follow a logical drawing sequence: structure → filling → details
-3. Use colors appropriate to the subject
-4. Maintain consistent proportions and perspective`;
+Please provide 2-3 drawing commands each time, making visible progress with each addition.
+Always end with a pause command so we can see your creative work unfold!`;
 
 async function processUserPrompt(prompt, canvasState) {
     console.log('\n=== Processing New AI Request ===');
@@ -234,29 +258,76 @@ async function processUserPrompt(prompt, canvasState) {
         // Try to parse the response as JSON
         try {
             console.log('\nAttempting to parse response as JSON...');
-            // Remove any potential markdown formatting
-            const cleanJson = text.replace(/^```json\n|\n```$/g, '').trim();
+            
+            // Handle the new response format with <think></think> tags
+            let cleanJson = text;
+            
+            // Check if the response contains <think> tags
+            if (text.includes('<think>') && text.includes('</think>')) {
+                // Extract everything after the closing </think> tag
+                cleanJson = text.split('</think>').pop().trim();
+                console.log('Extracted reasoning from <think> tags');
+            }
+            
+            // More thorough markdown cleanup
+            // 1. Remove any markdown code block markers with or without language specifier
+            cleanJson = cleanJson.replace(/```(?:json|javascript)?\s*\n?/g, '');
+            
+            // 2. Remove any remaining backticks at start or end
+            cleanJson = cleanJson.replace(/^`+|`+$/g, '').trim();
+            
             console.log('Cleaned JSON:', cleanJson);
             
-            const commands = JSON.parse(cleanJson);
-            
-            if (!Array.isArray(commands)) {
-                throw new Error('Response is not an array');
+            try {
+                const commands = JSON.parse(cleanJson);
+                
+                if (!Array.isArray(commands)) {
+                    throw new Error('Response is not an array');
+                }
+                
+                console.log('\nSuccessfully parsed commands:', JSON.stringify(commands, null, 2));
+                
+                // Add the response to conversation history
+                conversationHistory.push(prompt);
+                conversationHistory.push(text); // Keep the full text with thinking for context
+                
+                // Keep history limited to last 10 messages
+                if (conversationHistory.length > 10) {
+                    conversationHistory = conversationHistory.slice(-10);
+                }
+                console.log('Updated conversation history, current length:', conversationHistory.length);
+                
+                return commands;
+            } catch (jsonError) {
+                // If parsing fails, try to find an array in the text
+                console.log('Initial JSON.parse failed, attempting to extract valid JSON array');
+                
+                // Look for array pattern [...] 
+                const arrayMatch = cleanJson.match(/\[\s*{[\s\S]*}\s*\]/);
+                if (arrayMatch) {
+                    const extractedArray = arrayMatch[0];
+                    console.log('Found JSON array pattern:', extractedArray.substring(0, 50) + '...');
+                    
+                    const extractedCommands = JSON.parse(extractedArray);
+                    if (Array.isArray(extractedCommands)) {
+                        console.log('Successfully parsed extracted JSON array');
+                        
+                        // Add the response to conversation history
+                        conversationHistory.push(prompt);
+                        conversationHistory.push(text);
+                        
+                        // Keep history limited to last 10 messages
+                        if (conversationHistory.length > 10) {
+                            conversationHistory = conversationHistory.slice(-10);
+                        }
+                        
+                        return extractedCommands;
+                    }
+                }
+                
+                // If we're still here, rethrow the original error
+                throw jsonError;
             }
-            
-            console.log('\nSuccessfully parsed commands:', JSON.stringify(commands, null, 2));
-            
-            // Add the response to conversation history
-            conversationHistory.push(prompt);
-            conversationHistory.push(text);
-            
-            // Keep history limited to last 10 messages
-            if (conversationHistory.length > 10) {
-                conversationHistory = conversationHistory.slice(-10);
-            }
-            console.log('Updated conversation history, current length:', conversationHistory.length);
-            
-            return commands;
         } catch (error) {
             console.error('\n❌ Failed to parse AI response:', error.message);
             console.error('Raw response that failed parsing:', text);
@@ -333,10 +404,36 @@ async function analyzeLiveCanvas(canvasState, previousAnalysis = null, originalP
         
         // Parse the analysis JSON
         try {
-            const cleanJson = text.replace(/^```json\n|\n```$/g, '').trim();
-            const analysis = JSON.parse(cleanJson);
-            console.log('Canvas analysis results:', JSON.stringify(analysis, null, 2));
-            return analysis;
+            // Remove any markdown formatting
+            let cleanJson = text.replace(/```(?:json|javascript)?\s*\n?/g, '').trim();
+            cleanJson = cleanJson.replace(/^`+|`+$/g, '').trim();
+            
+            try {
+                const analysis = JSON.parse(cleanJson);
+                console.log('Canvas analysis results:', JSON.stringify(analysis, null, 2));
+                return analysis;
+            } catch (jsonError) {
+                // If parsing fails, try to find an object in the text
+                console.log('Initial JSON.parse failed, attempting to extract valid JSON object');
+                
+                // Look for object pattern {...} 
+                const objectMatch = cleanJson.match(/\{\s*"[^"]+"\s*:[\s\S]*\}/);
+                if (objectMatch) {
+                    const extractedObject = objectMatch[0];
+                    console.log('Found JSON object pattern:', extractedObject.substring(0, 50) + '...');
+                    
+                    try {
+                        const extractedAnalysis = JSON.parse(extractedObject);
+                        console.log('Successfully parsed extracted JSON object');
+                        return extractedAnalysis;
+                    } catch (e) {
+                        console.error('Failed to parse extracted object:', e);
+                    }
+                }
+                
+                // If we're still here, no valid JSON object could be found
+                throw new Error('Could not find valid JSON object in response');
+            }
         } catch (error) {
             console.error('Failed to parse analysis:', error);
             return null;
@@ -432,15 +529,53 @@ async function continueDrawing(canvasState, originalPrompt, currentPhase = 1) {
         
         // Parse the continuation commands
         try {
-            const cleanJson = text.replace(/^```json\n|\n```$/g, '').trim();
-            const commands = JSON.parse(cleanJson);
+            // Handle the new response format with <think></think> tags
+            let cleanJson = text;
             
-            if (!Array.isArray(commands)) {
-                throw new Error('Response is not an array');
+            // Check if the response contains <think> tags
+            if (text.includes('<think>') && text.includes('</think>')) {
+                // Extract everything after the closing </think> tag
+                cleanJson = text.split('</think>').pop().trim();
+                console.log('Extracted reasoning from <think> tags');
             }
             
-            console.log('Successfully parsed continuation commands:', commands.length);
-            return commands;
+            // Remove any markdown formatting
+            cleanJson = cleanJson.replace(/```(?:json|javascript)?\s*\n?/g, '').trim();
+            cleanJson = cleanJson.replace(/^`+|`+$/g, '').trim();
+            
+            try {
+                const commands = JSON.parse(cleanJson);
+                
+                if (!Array.isArray(commands)) {
+                    throw new Error('Response is not an array');
+                }
+                
+                console.log('Successfully parsed continuation commands:', commands.length);
+                return commands;
+            } catch (jsonError) {
+                // If parsing fails, try to find an array in the text
+                console.log('Initial JSON.parse failed, attempting to extract valid JSON array');
+                
+                // Look for array pattern [...] 
+                const arrayMatch = cleanJson.match(/\[\s*{[\s\S]*}\s*\]/);
+                if (arrayMatch) {
+                    const extractedArray = arrayMatch[0];
+                    console.log('Found JSON array pattern:', extractedArray.substring(0, 50) + '...');
+                    
+                    try {
+                        const extractedCommands = JSON.parse(extractedArray);
+                        if (Array.isArray(extractedCommands)) {
+                            console.log('Successfully parsed extracted JSON array');
+                            return extractedCommands;
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse extracted array:', e);
+                    }
+                }
+                
+                // If we're still here, no valid JSON array could be found
+                throw new Error('Could not find valid JSON array in response');
+            }
         } catch (error) {
             console.error('Failed to parse continuation commands:', error);
             return [];
@@ -512,8 +647,14 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         const analysis = await analyzeLiveCanvas(canvasState, lastCanvasAnalysis, originalPrompt);
         if (!analysis) {
             console.error('Failed to analyze canvas state');
-            // Return simple drawing command instead of empty array
-            return getEmergencyDrawCommand(currentPhase, originalPrompt);
+            // No longer return emergency draw commands, instead return a failure notification
+            return [{ 
+                "endpoint": "/api/drawing_failed", 
+                "params": { 
+                    "reason": "Failed to analyze canvas state", 
+                    "recoverable": true 
+                }
+            }];
         }
         
         // Save the current analysis regardless of changes
@@ -539,28 +680,32 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         // Get phase-specific context
         const phaseInstructions = getPhaseInstructions(currentPhase);
         
-        // Prepare a special streaming prompt that emphasizes action
+        // Prepare a friendly streaming prompt that encourages creativity
         const streamingPrompt = `
-            I need to draw: "${originalPrompt}" in streaming mode.
+            You're drawing "${originalPrompt}" on the canvas.
             
-            Current canvas state (${analysis.completionPercentage}% complete):
+            Current canvas (${analysis.completionPercentage}% complete):
             ${analysis.analysis}
             
-            Current phase: Phase ${currentPhase} - ${phaseInstructions.name}
+            Remember to structure your thought process inside <think></think> XML tags first, then provide only the JSON array of commands after.
             
-            YOU MUST provide EXACTLY 2-3 drawing commands that will make VISIBLE changes to the canvas.
-            Focus on: ${analysis.suggestions?.slice(0, 2).join(', ') || 'creating recognizable elements that match the prompt'}
+            Let's keep building on what you've created! Please add 2-3 drawing commands that will:
+            - Make visible progress on "${originalPrompt}"
+            - Build upon what's already on the canvas
+            - Focus on: ${analysis.suggestions?.slice(0, 2).join(', ') || 'creating expressive elements that match the prompt'}
             
-            IMPORTANT RULES:
-            1. YOU MUST provide at least one /api/draw command in your response
-            2. EVERY command MUST include ALL parameters
-            3. Each command must create something directly related to the prompt
-            4. YOUR RESPONSE WILL BE REJECTED if it does not include at least one drawing command
+            Creative guidelines:
+            • Use bold lines (lineWidth 3-8) to ensure your art stands out
+            • Embrace the charming MS Paint aesthetic - expressive over detailed
+            • Use the full canvas (800x600) to give your art room to breathe
+            • Choose vibrant colors that bring energy to your creation
             
-            DO NOT waste time with tool changes unless absolutely necessary.
-            Remember to end with a pause command.
+            Technical needs:
+            • Include at least one drawing command (/api/draw)
+            • Include all necessary parameters in each command
+            • End with a pause command so we can see your progress
             
-            The user prompt is: "${originalPrompt}"
+            Have fun creating "${originalPrompt}"!
         `;
         
         console.log('Streaming prompt prepared');
@@ -604,114 +749,150 @@ async function streamingModeUpdate(canvasState, originalPrompt, currentPhase = 1
         
         // Parse the streaming commands
         try {
-            const cleanJson = text.replace(/^```json\n|\n```$/g, '').trim();
-            const commands = JSON.parse(cleanJson);
+            // Handle the new response format with <think></think> tags
+            let cleanJson = text;
             
-            if (!Array.isArray(commands)) {
-                throw new Error('Response is not an array');
+            // Check if the response contains <think> tags
+            if (text.includes('<think>') && text.includes('</think>')) {
+                // Extract everything after the closing </think> tag
+                cleanJson = text.split('</think>').pop().trim();
+                console.log('Extracted reasoning from <think> tags');
             }
             
-            // Ensure we don't exceed batch size
-            const batchedCommands = commands.slice(0, streamingBatchSize);
+            // More thorough markdown cleanup
+            // 1. Remove any markdown code block markers with or without language specifier
+            cleanJson = cleanJson.replace(/```(?:json|javascript)?\s*\n?/g, '');
             
-            // Validate that the commands include at least one draw command
-            let hasDrawCommand = batchedCommands.some(cmd => cmd.endpoint === '/api/draw');
+            // 2. Remove any remaining backticks at start or end
+            cleanJson = cleanJson.replace(/^`+|`+$/g, '').trim();
             
-            // If no draw commands, return emergency draw commands
-            if (!hasDrawCommand) {
-                console.log('No draw commands received, using emergency commands');
-                return getEmergencyDrawCommand(currentPhase, originalPrompt);
+            try {
+                const commands = JSON.parse(cleanJson);
+                
+                if (!Array.isArray(commands)) {
+                    throw new Error('Response is not an array');
+                }
+                
+                // Ensure we don't exceed batch size
+                const batchedCommands = commands.slice(0, streamingBatchSize);
+                
+                // Validate that the commands include at least one draw command
+                let hasDrawCommand = batchedCommands.some(cmd => cmd.endpoint === '/api/draw');
+                
+                // If no draw commands, return a failure notification instead of emergency commands
+                if (!hasDrawCommand) {
+                    console.log('No draw commands received, notifying client of failure');
+                    return [{ 
+                        "endpoint": "/api/drawing_failed", 
+                        "params": { 
+                            "reason": "AI did not generate any drawing commands", 
+                            "recoverable": true 
+                        }
+                    }];
+                }
+                
+                // Make sure we end with a pause to trigger the next update
+                if (batchedCommands.length > 0 && 
+                    (batchedCommands[batchedCommands.length - 1].endpoint !== '/api/pause')) {
+                    batchedCommands.push({
+                        "endpoint": "/api/pause", 
+                        "params": {"duration": 1000}
+                    });
+                }
+                
+                console.log('Streaming batch commands:', batchedCommands.length);
+                return batchedCommands;
+            } catch (jsonError) {
+                // If parsing fails, try to find an array in the text
+                console.log('Initial JSON.parse failed, attempting to extract valid JSON array');
+                
+                // Look for array pattern [...] 
+                const arrayMatch = cleanJson.match(/\[\s*{[\s\S]*}\s*\]/);
+                if (arrayMatch) {
+                    const extractedArray = arrayMatch[0];
+                    console.log('Found JSON array pattern:', extractedArray.substring(0, 50) + '...');
+                    
+                    try {
+                        const extractedCommands = JSON.parse(extractedArray);
+                        if (Array.isArray(extractedCommands)) {
+                            console.log('Successfully parsed extracted JSON array');
+                            
+                            // Ensure we don't exceed batch size
+                            const batchedCommands = extractedCommands.slice(0, streamingBatchSize);
+                            
+                            // Validate that the commands include at least one draw command
+                            let hasDrawCommand = batchedCommands.some(cmd => cmd.endpoint === '/api/draw');
+                            
+                            // If no draw commands, return a failure notification
+                            if (!hasDrawCommand) {
+                                console.log('No draw commands in extracted array');
+                                return [{ 
+                                    "endpoint": "/api/drawing_failed", 
+                                    "params": { 
+                                        "reason": "AI did not generate any drawing commands", 
+                                        "recoverable": true 
+                                    }
+                                }];
+                            }
+                            
+                            // Make sure we end with a pause to trigger the next update
+                            if (batchedCommands.length > 0 && 
+                                (batchedCommands[batchedCommands.length - 1].endpoint !== '/api/pause')) {
+                                batchedCommands.push({
+                                    "endpoint": "/api/pause", 
+                                    "params": {"duration": 1000}
+                                });
+                            }
+                            
+                            console.log('Streaming batch commands from extracted array:', batchedCommands.length);
+                            return batchedCommands;
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse extracted array:', e);
+                    }
+                }
+                
+                // If we're still here, no valid JSON array could be found
+                throw new Error('Could not find valid JSON array in response');
             }
-            
-            // Make sure we end with a pause to trigger the next update
-            if (batchedCommands.length > 0 && 
-                (batchedCommands[batchedCommands.length - 1].endpoint !== '/api/pause')) {
-                batchedCommands.push({
-                    "endpoint": "/api/pause", 
-                    "params": {"duration": 1000}
-                });
-            }
-            
-            console.log('Streaming batch commands:', batchedCommands.length);
-            return batchedCommands;
         } catch (error) {
             console.error('FAILURE: Failed to parse streaming commands:', error);
-            return getEmergencyDrawCommand(currentPhase, originalPrompt);
+            return [{ 
+                "endpoint": "/api/drawing_failed", 
+                "params": { 
+                    "reason": "Failed to parse AI response: " + error.message, 
+                    "recoverable": true 
+                }
+            }];
         }
     } catch (error) {
         console.error('FAILURE: Error in streaming mode update:', error);
-        return getEmergencyDrawCommand(currentPhase, originalPrompt);
+        return [{ 
+            "endpoint": "/api/drawing_failed", 
+            "params": { 
+                "reason": "AI drawing error: " + error.message, 
+                "recoverable": false 
+            }
+        }];
     } finally {
         console.log('=== Streaming Update Complete ===\n');
     }
 }
 
-// New helper function that returns emergency drawing commands
+// Replace emergency drawing commands with failure notification
 function getEmergencyDrawCommand(phase, prompt) {
-    // Always provide at least one drawing command based on the phase
-    console.log('Generating emergency drawing command');
+    // Instead of providing drawing commands, return a failure notification
+    console.log('Drawing failed - returning failure notification');
     
-    const canvas_width = 800;
-    const canvas_height = 600;
-    const centerX = canvas_width / 2;
-    const centerY = canvas_height / 2;
-    
-    // Generate a semi-random position that stays in center-ish region
-    const randomX = Math.floor(Math.random() * (canvas_width * 0.6) + canvas_width * 0.2);
-    const randomY = Math.floor(Math.random() * (canvas_height * 0.6) + canvas_height * 0.2);
-    
-    // Colors appropriate for beach scene
-    const beachColors = ['#F4A460', '#87CEEB', '#008080', '#FFD700', '#CD853F', '#000000'];
-    const randomColor = beachColors[Math.floor(Math.random() * beachColors.length)];
-    
-    switch(phase) {
-        case 1: // Outline phase - draw a simple shape
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": "#000000" }},
-                { "endpoint": "/api/linewidth", "params": { "width": 2 }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": "#000000", 
-                    "lineWidth": 2, 
-                    "startX": randomX, 
-                    "startY": randomY, 
-                    "x": randomX + 50, 
-                    "y": randomY + 50 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        case 2: // Coloring phase - add some color
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "fill" }},
-                { "endpoint": "/api/color", "params": { "color": randomColor }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "fill", 
-                    "color": randomColor, 
-                    "lineWidth": 1, 
-                    "startX": randomX, 
-                    "startY": randomY, 
-                    "x": randomX, 
-                    "y": randomY 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-        default: // Detail phase - add some details
-            return [
-                { "endpoint": "/api/tool", "params": { "tool": "pencil" }},
-                { "endpoint": "/api/color", "params": { "color": randomColor }},
-                { "endpoint": "/api/draw", "params": { 
-                    "tool": "pencil", 
-                    "color": randomColor, 
-                    "lineWidth": 3, 
-                    "startX": randomX, 
-                    "startY": randomY, 
-                    "x": randomX + 20, 
-                    "y": randomY + 20 
-                }},
-                { "endpoint": "/api/pause", "params": { "duration": 1000 }}
-            ];
-    }
+    return [{ 
+        "endpoint": "/api/drawing_failed", 
+        "params": { 
+            "reason": "AI failed to generate drawing commands", 
+            "phase": phase, 
+            "prompt": prompt,
+            "recoverable": true 
+        }
+    }];
 }
 
 // Function to provide example commands for different phases

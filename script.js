@@ -226,6 +226,30 @@ ws.onmessage = (event) => {
             aiPrompt.disabled = false;
             sendPromptButton.disabled = false;
             break;
+        case 'DRAWING_FAILED':
+            console.error('Drawing failed:', data.reason);
+            
+            // Show a clear error message to the user
+            showDrawingFailure(data.reason, data.recoverable, data.phase);
+            
+            // Re-enable AI controls so the user can try again
+            aiPrompt.disabled = false;
+            sendPromptButton.disabled = false;
+            
+            // If in streaming mode, stop it
+            if (streamingMode) {
+                streamingMode = false;
+                streamingModeCheckbox.checked = false;
+                
+                // Clear any update interval
+                if (canvasUpdateInterval) {
+                    clearInterval(canvasUpdateInterval);
+                    canvasUpdateInterval = null;
+                }
+                
+                updateStreamingStatus();
+            }
+            break;
         case 'ERROR':
             console.error('Error:', data.message);
             showDrawingStatus(`Error: ${data.message}`);
@@ -751,9 +775,9 @@ function createCanvasWithGridOverlay() {
 // Function to draw grid overlay with coordinates
 function drawGrid(ctx, width, height) {
     const gridSize = 50; // Size of grid cells in pixels
-    const gridColor = 'rgba(100, 100, 100, 0.3)'; // Semi-transparent gray
-    const labelColor = 'rgba(50, 50, 200, 0.7)'; // Semi-transparent blue for labels
-    const labelFont = '10px Arial';
+    const gridColor = 'rgba(200, 200, 200, 0.2)'; // Semi-transparent gray
+    const labelColor = 'rgba(50, 50, 200, 0.5)'; // Semi-transparent blue for labels
+    const labelFont = '8px Arial';
     
     ctx.save();
     
@@ -1103,4 +1127,58 @@ streamingStyleSheet.textContent = `
         background: rgba(76, 175, 80, 0.8) !important;
     }
 `;
-document.head.appendChild(streamingStyleSheet); 
+document.head.appendChild(streamingStyleSheet);
+
+// Add function to show drawing failure with clear UI indication
+function showDrawingFailure(reason, recoverable, phase) {
+    // Create a failure overlay that is more noticeable than regular status
+    const overlay = document.createElement('div');
+    overlay.id = 'failureOverlay';
+    overlay.style.position = 'absolute';
+    overlay.style.top = '50%';
+    overlay.style.left = '50%';
+    overlay.style.transform = 'translate(-50%, -50%)';
+    overlay.style.background = 'rgba(255, 0, 0, 0.8)';
+    overlay.style.color = 'white';
+    overlay.style.padding = '20px';
+    overlay.style.borderRadius = '10px';
+    overlay.style.zIndex = '3000';
+    overlay.style.maxWidth = '80%';
+    overlay.style.textAlign = 'center';
+    overlay.style.boxShadow = '0 0 20px rgba(0, 0, 0, 0.5)';
+    
+    // Build message content
+    let message = '<h3>AI Drawing Failed</h3>';
+    message += `<p>${reason}</p>`;
+    
+    if (phase) {
+        message += `<p>Failed during Phase ${phase}</p>`;
+    }
+    
+    message += recoverable ? 
+        '<p>You can try again with a different prompt or adjust settings.</p>' : 
+        '<p>This error is not automatically recoverable.</p>';
+    
+    // Add a close button
+    message += '<button id="closeFailureBtn" style="margin-top: 15px; padding: 8px 15px; background: white; color: red; border: none; border-radius: 5px; cursor: pointer;">Close</button>';
+    
+    overlay.innerHTML = message;
+    document.querySelector('.container').appendChild(overlay);
+    
+    // Add event listener to close button
+    document.getElementById('closeFailureBtn').addEventListener('click', () => {
+        if (overlay.parentNode) {
+            overlay.parentNode.removeChild(overlay);
+        }
+    });
+    
+    // Auto-remove after 8 seconds
+    setTimeout(() => {
+        if (overlay.parentNode) {
+            overlay.parentNode.removeChild(overlay);
+        }
+    }, 8000);
+    
+    // Also show in the status area
+    showDrawingStatus(`Drawing failed: ${reason}`);
+} 

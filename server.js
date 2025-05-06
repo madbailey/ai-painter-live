@@ -554,6 +554,27 @@ app.post('/api/streaming-mode', (req, res) => {
     });
 });
 
+// Add a new API endpoint for drawing failures
+app.post('/api/drawing_failed', (req, res) => {
+    console.log('\n❌ POST /api/drawing_failed');
+    console.log('Drawing failed:', req.body);
+    
+    // Broadcast the failure to all connected clients
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                type: 'DRAWING_FAILED',
+                reason: req.body.reason || 'Unknown error',
+                recoverable: req.body.recoverable || false,
+                phase: req.body.phase,
+                prompt: req.body.prompt
+            }));
+        }
+    });
+
+    res.json({ success: true });
+});
+
 // Helper function to execute drawing commands
 async function executeCommands(commands, ws) {
     // Track if we need to continue drawing
@@ -582,6 +603,28 @@ async function executeCommands(commands, ws) {
         return command;
     });
     
+    // Check for drawing failure
+    const failureCommand = validatedCommands.find(cmd => cmd.endpoint === '/api/drawing_failed');
+    if (failureCommand) {
+        console.log('Drawing failure detected:', failureCommand.params);
+        
+        // Notify clients of the failure
+        wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'DRAWING_FAILED',
+                    reason: failureCommand.params.reason || 'Unknown drawing error',
+                    recoverable: failureCommand.params.recoverable || false,
+                    phase: failureCommand.params.phase,
+                    prompt: failureCommand.params.prompt
+                }));
+            }
+        });
+        
+        console.log('Drawing failure notification sent to clients');
+        return;
+    }
+
     // Use validatedCommands instead of raw commands
     for (const command of validatedCommands) {
         if (command.endpoint && command.params) {
