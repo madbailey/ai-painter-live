@@ -1,875 +1,379 @@
 const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const path = require('path');
-const { processUserPrompt, clearConversation, continueDrawing, streamingModeUpdate, toggleStreamingMode, setStreamingBatchSize } = require('./services/gemini');
+const fs = require('fs/promises');
+const cors = require('cors');
+const http = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
+require('dotenv').config();
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 3000;
 
-// Middleware
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEFAULT_RESPONSES_MODEL = process.env.OPENAI_RESPONSES_MODEL || 'gpt-5.2';
+const LOGS_DIR = path.join(__dirname, 'logs');
+const IMAGES_DIR = path.join(LOGS_DIR, 'images');
+const RUN_INDEX_PATH = path.join(LOGS_DIR, 'run_index.jsonl');
+const MAX_INDEX_ROWS = 200;
+const MAX_SCREENSHOTS_TO_SAVE = 80;
+
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
+app.use(express.json({ limit: '35mb' }));
 app.use(express.static(path.join(__dirname, '.')));
 
-// Store canvas state
-let canvasState = null;
-let connectedClients = new Set();
+function toPosixRelative(absolutePath) {
+  return path.relative(__dirname, absolutePath).replace(/\\/g, '/');
+}
 
-// Add a queue for pending canvas updates
-let canvasUpdateQueue = new Map(); // client -> latest canvas data
-let isProcessingAI = false;
+function sanitizeFilenameSegment(rawValue, fallback) {
+  const clean = String(rawValue || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_.]+|[-_.]+$/g, '');
 
-//track consecutive errors 
-let consecutiveErrors = 0;
-const MAX_CONSECUTIVE_ERRORS = 5;
+  return clean || fallback;
+}
 
-//set a hearbeat system for connection stabiltiy 
-const HEARTBEAT_INTERVAL = 30000; // 30 seconds
+function formatTimestampForFilename(dateLike) {
+  const date = new Date(dateLike);
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  const y = safeDate.getFullYear();
+  const m = String(safeDate.getMonth() + 1).padStart(2, '0');
+  const d = String(safeDate.getDate()).padStart(2, '0');
+  const hh = String(safeDate.getHours()).padStart(2, '0');
+  const mm = String(safeDate.getMinutes()).padStart(2, '0');
+  const ss = String(safeDate.getSeconds()).padStart(2, '0');
+  return `${y}${m}${d}_${hh}${mm}${ss}`;
+}
 
-const clientTimingMetrics = new Map();
+async function fileExists(absolutePath) {
+  try {
+    await fs.access(absolutePath);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
 
-// Add a tracker for the current drawing phase
-let currentDrawingPhase = 1;
+async function allocateArtifactBaseName(model, timestamp) {
+  const modelPart = sanitizeFilenameSegment(model, 'model');
+  const stampPart = sanitizeFilenameSegment(timestamp, formatTimestampForFilename(new Date()));
+  const baseCore = `${modelPart}_${stampPart}`;
 
-// Add streaming mode state tracking
-let streamingModeEnabled = false;
-const DEFAULT_STREAMING_INTERVAL = 500; // Increased to 500ms for smoother updates
-const MIN_STREAMING_INTERVAL = 200; // Minimum allowed interval
-const MAX_STREAMING_INTERVAL = 2000; // Maximum allowed interval
+  let suffix = 0;
+  while (true) {
+    const baseName = suffix > 0 ? `${baseCore}_${suffix}` : baseCore;
+    const logPath = path.join(LOGS_DIR, `${baseName}.json`);
+    if (!(await fileExists(logPath))) {
+      return baseName;
+    }
+    suffix += 1;
+  }
+}
 
-// WebSocket connection handling
-wss.on('connection', (ws) => {
-    console.log('\n🔌 New client connected');
-    console.log('Total connected clients:', connectedClients.size + 1);
-    connectedClients.add(ws);
-    
-    // Initialize client state
-    ws.originalPrompt = null;
-    ws.currentPhase = 1;
-    ws.streamingMode = false;
-    ws.lastCanvasUpdate = Date.now();
-    ws.streamingInterval = DEFAULT_STREAMING_INTERVAL;
-    ws.isProcessingCommand = false;
-    ws.lastCommandTime = 0;
-    
-    // Setup heartbeat for connection stability (do this only once per connection)
-    if (!ws.heartbeatSetup) {
-        ws.isAlive = true;
-        
-        // Remove any existing pong listeners if they exist
-        ws.removeAllListeners('pong');
-        
-        ws.on('pong', () => {
-            ws.isAlive = true;
-        });
-        ws.heartbeatSetup = true;
+function parseImageDataUrl(dataUrl) {
+  const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ''));
+  if (!match) {
+    throw new Error('Invalid image data URL.');
+  }
+
+  return {
+    mimeType: match[1].toLowerCase(),
+    buffer: Buffer.from(match[2], 'base64')
+  };
+}
+
+function imageExtForMimeType(mimeType) {
+  if (mimeType === 'image/png') return 'png';
+  if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') return 'jpg';
+  if (mimeType === 'image/webp') return 'webp';
+  return 'bin';
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    mode: 'responses-websocket-proxy',
+    defaultModel: DEFAULT_RESPONSES_MODEL,
+    hasApiKey: Boolean(OPENAI_API_KEY)
+  });
+});
+
+app.get('/api/runs/index', async (req, res) => {
+  try {
+    const requestedLimit = Number.parseInt(String(req.query.limit || ''), 10);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.max(1, Math.min(MAX_INDEX_ROWS, requestedLimit))
+      : MAX_INDEX_ROWS;
+
+    let raw = '';
+    try {
+      raw = await fs.readFile(RUN_INDEX_PATH, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        res.json({ ok: true, rows: [] });
+        return;
+      }
+      throw error;
     }
 
-    ws.on('message', async (message) => {
+    const rows = raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-limit)
+      .map((line) => {
         try {
-            const data = JSON.parse(message);
-            console.log('\n📩 Received WebSocket message:', data.type);
-
-            // Reset error count on successful message
-            consecutiveErrors = 0;
-
-            // Process the message based on its type
-            switch (data.type) {
-                case 'CANVAS_UPDATE':
-                    console.log('Processing canvas update...');
-                    const now = Date.now();
-                    
-                    // Store current canvas state
-                    canvasState = data.canvasData;
-                    
-                    // Store canvas timestamp for timing diagnostics
-                    const canvasStateTimestamp = now;
-                    
-                    // Add to queue instead of skipping - always store the latest update
-                    if (ws.streamingMode && ws.originalPrompt) {
-                        canvasUpdateQueue.set(ws, {
-                            canvasData: canvasState,
-                            timestamp: now
-                        });
-                        
-                        // If we're not already processing, start processing the queue
-                        if (!ws.isProcessingCommand) {
-                            processNextCanvasUpdate();
-                        } else {
-                            console.log('AI is busy, update queued for later processing');
-                        }
-                    }
-                    
-                    // Always broadcast to other clients, even if we queue processing
-                    broadcastToOthers(ws, {
-                        type: 'CANVAS_UPDATE',
-                        canvasData: canvasState,
-                        timestamp: now
-                    });
-                    
-                    console.log('Canvas state updated and broadcasted');
-                    break;
-
-                case 'DRAW_ACTION':
-                    console.log('Broadcasting draw action:', data.action);
-                    // Broadcast drawing actions to all other clients
-                    broadcastToOthers(ws, {
-                        type: 'DRAW_ACTION',
-                        action: data.action
-                    });
-                    break;
-
-                case 'AI_PROMPT':
-                    console.log('\n🤖 Processing AI prompt:', data.prompt);
-                    // Store the original prompt for continuation or streaming
-                    ws.originalPrompt = data.prompt;
-                    // Reset phase to 1 for new drawings
-                    ws.currentPhase = 1;
-                    currentDrawingPhase = 1;
-                    
-                    // If streaming mode is active, handle differently
-                    if (data.streamingMode) {
-                        console.log('Starting streaming mode drawing session');
-                        // Enable streaming mode for this client
-                        ws.streamingMode = true;
-                        toggleStreamingMode(true);
-                        
-                        // Send initial status to client
-                        ws.send(JSON.stringify({
-                            type: 'STREAMING_MODE_STARTED',
-                            prompt: data.prompt
-                        }));
-                        
-                        // Request an immediate canvas update to start the process
-                        ws.send(JSON.stringify({
-                            type: 'REQUEST_CANVAS_UPDATE'
-                        }));
-                    } else {
-                        // Process AI prompt in batch mode (existing behavior)
-                        const commands = await processUserPrompt(data.prompt, canvasState);
-                        console.log('AI returned commands:', commands.length);
-                        
-                        await executeCommands(commands, ws);
-                        console.log('Finished executing AI commands');
-                    }
-                    break;
-
-                case 'CONTINUE_DRAWING':
-                    console.log('\n🖌️ Continuing the drawing process in phase', ws.currentPhase);
-                    if (!ws.originalPrompt) {
-                        ws.originalPrompt = "the current drawing";
-                    }
-                    
-                    // If in streaming mode, just request a canvas update
-                    if (ws.streamingMode) {
-                        console.log('Continuing in streaming mode');
-                        ws.send(JSON.stringify({
-                            type: 'REQUEST_CANVAS_UPDATE'
-                        }));
-                    } else {
-                        // Request additional drawing commands (batch mode)
-                        const continuationCommands = await continueDrawing(
-                            canvasState, 
-                            ws.originalPrompt, 
-                            ws.currentPhase
-                        );
-                        console.log('AI returned continuation commands:', continuationCommands.length);
-                        
-                        if (continuationCommands.length > 0) {
-                            await executeCommands(continuationCommands, ws);
-                            console.log('Finished executing continuation commands');
-                        } else {
-                            console.log('No continuation commands - drawing may be complete');
-                            ws.send(JSON.stringify({
-                                type: 'DRAWING_COMPLETE'
-                            }));
-                        }
-                    }
-                    break;
-                    
-                case 'TOGGLE_STREAMING_MODE':
-                    console.log('\n🔄 Toggling streaming mode:', data.enabled);
-                    ws.streamingMode = data.enabled;
-                    toggleStreamingMode(data.enabled);
-                    
-                    // Update streaming interval if provided
-                    if (data.interval) {
-                        ws.streamingInterval = Math.max(MIN_STREAMING_INTERVAL, 
-                            Math.min(MAX_STREAMING_INTERVAL, data.interval));
-                        console.log('Streaming interval set to', ws.streamingInterval, 'ms');
-                    }
-                    
-                    // Update batch size if provided
-                    if (data.batchSize) {
-                        setStreamingBatchSize(data.batchSize);
-                    }
-                    
-                    ws.send(JSON.stringify({
-                        type: 'STREAMING_MODE_UPDATE',
-                        enabled: ws.streamingMode,
-                        interval: ws.streamingInterval
-                    }));
-                    break;
-            }
-
-            // Update the last canvas update time
-            ws.lastCanvasUpdate = Date.now();
-
-        } catch (error) {
-            // Add recovery logic
-            if (consecutiveErrors > 2) {
-                ws.send(JSON.stringify({
-                    type: 'AI_RESET',
-                    canvasState: canvasState,
-                    phase: currentDrawingPhase
-                }));
-                console.log('Sent recovery reset signal');
-            }
-            consecutiveErrors++;
-            console.error('\n❌ Error processing message:', error.message);
-            console.error('Full error:', error);
-            ws.send(JSON.stringify({
-                type: 'ERROR',
-                message: error.message
-            }));
-
-            ws.send(JSON.stringify({
-                type: 'ERROR',
-                message: 'Connection error. Please reconnect.',
-                recoverable: consecutiveErrors < MAX_CONSECUTIVE_ERRORS
-            }));
-
-            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-                console.log('Too many consecutive errors. Disconnecting client.');
-                clearConversation();
-                ws.terminate();
-                consecutiveErrors = 0;
-            }
+          return JSON.parse(line);
+        } catch (_error) {
+          return null;
         }
-    });
+      })
+      .filter(Boolean);
 
-    ws.on('close', () => {
-        console.log('\n🔌 Client disconnected');
-        connectedClients.delete(ws);
-        
-        // Clean up any event listeners
-        ws.removeAllListeners();
-        
-        console.log('Remaining connected clients:', connectedClients.size);
+    res.json({ ok: true, rows });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message || 'Failed to read run index.'
     });
+  }
+});
 
-    ws.on('error', (error) => {
-        console.error('\n❌ WebSocket error:', error);
-        connectedClients.delete(ws);
-        
-        // Clean up any event listeners
-        ws.removeAllListeners();
-    });
+app.post('/api/runs/save', async (req, res) => {
+  const { log, finalImageDataUrl, screenshots } = req.body || {};
+  if (!log || typeof log !== 'object') {
+    res.status(400).json({ ok: false, message: 'Missing `log` object.' });
+    return;
+  }
 
-    // Send current canvas state to new client
-    if (canvasState) {
-        console.log('Sending current canvas state to new client');
-        ws.send(JSON.stringify({
-            type: 'CANVAS_UPDATE',
-            canvasData: canvasState
-        }));
+  try {
+    await fs.mkdir(LOGS_DIR, { recursive: true });
+    await fs.mkdir(IMAGES_DIR, { recursive: true });
+
+    const model = String(log.model || DEFAULT_RESPONSES_MODEL || 'model');
+    const timestamp = formatTimestampForFilename(log.endedAt || log.startedAt || new Date());
+    const baseName = await allocateArtifactBaseName(model, timestamp);
+    const savedAt = new Date().toISOString();
+    const warnings = [];
+
+    let finalImageFile = null;
+    if (typeof finalImageDataUrl === 'string' && finalImageDataUrl.startsWith('data:image/')) {
+      try {
+        const parsed = parseImageDataUrl(finalImageDataUrl);
+        const ext = imageExtForMimeType(parsed.mimeType);
+        const finalPath = path.join(IMAGES_DIR, `${baseName}_final.${ext}`);
+        await fs.writeFile(finalPath, parsed.buffer);
+        finalImageFile = toPosixRelative(finalPath);
+      } catch (error) {
+        warnings.push(`Final image save failed: ${error.message}`);
+      }
     }
-});
 
-// Set up the heartbeat interval only once
-const heartbeatInterval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-            connectedClients.delete(ws);
-            ws.removeAllListeners(); // Clean up event listeners
-            return ws.terminate();
-        }
-        
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, HEARTBEAT_INTERVAL);
+    const screenshotItems = Array.isArray(screenshots) ? screenshots : [];
+    const screenshotLimit = screenshotItems.slice(0, MAX_SCREENSHOTS_TO_SAVE);
+    if (screenshotItems.length > screenshotLimit.length) {
+      warnings.push(`Saved ${screenshotLimit.length}/${screenshotItems.length} screenshots due to save limit.`);
+    }
 
-// Clean up the interval on server close
-wss.on('close', () => {
-    clearInterval(heartbeatInterval);
-});
+    const screenshotFiles = [];
+    for (let i = 0; i < screenshotLimit.length; i += 1) {
+      const shot = screenshotLimit[i];
+      if (!shot || typeof shot.imageDataUrl !== 'string') continue;
 
-async function processCanvasWithAI(canvasState, ws) {
-    // Skip if we processed a canvas too recently
-    const clientId = ws._socket.remoteAddress + ':' + ws._socket.remotePort;
-    const metrics = clientTimingMetrics.get(clientId) || {
-        lastAnalysisTime: 0,
-        analysisInterval: 2000, // Start with 2 seconds between analyses
-        previousAnalysis: null
+      try {
+        const parsed = parseImageDataUrl(shot.imageDataUrl);
+        const ext = imageExtForMimeType(parsed.mimeType);
+        const index = String(i + 1).padStart(3, '0');
+        const imagePath = path.join(IMAGES_DIR, `${baseName}_shot_${index}.${ext}`);
+        await fs.writeFile(imagePath, parsed.buffer);
+
+        screenshotFiles.push({
+          atMs: Number.isFinite(Number(shot.atMs)) ? Number(shot.atMs) : null,
+          includeGrid: Boolean(shot.includeGrid),
+          width: Number.isFinite(Number(shot.width)) ? Number(shot.width) : null,
+          height: Number.isFinite(Number(shot.height)) ? Number(shot.height) : null,
+          file: toPosixRelative(imagePath)
+        });
+      } catch (error) {
+        warnings.push(`Screenshot ${i + 1} save failed: ${error.message}`);
+      }
+    }
+
+    const storage = {
+      autosaved: true,
+      savedAt,
+      baseName,
+      logFile: toPosixRelative(path.join(LOGS_DIR, `${baseName}.json`)),
+      finalImageFile,
+      screenshotFiles,
+      indexFile: toPosixRelative(RUN_INDEX_PATH),
+      warnings
     };
-    
-    const now = Date.now();
-    if (now - metrics.lastAnalysisTime < metrics.analysisInterval) {
-        return; // Too soon for another analysis
+
+    const logToPersist = {
+      ...log,
+      storage
+    };
+
+    const logPath = path.join(LOGS_DIR, `${baseName}.json`);
+    await fs.writeFile(logPath, JSON.stringify(logToPersist, null, 2), 'utf8');
+
+    const indexRow = {
+      savedAt,
+      runId: log.runId || null,
+      model,
+      prompt: typeof log.prompt === 'string' ? log.prompt : null,
+      startedAt: log.startedAt || null,
+      endedAt: log.endedAt || null,
+      finalReason: log.finalReason || null,
+      finishedByAgent: Boolean(log.finishedByAgent),
+      eventCount: Array.isArray(log.events) ? log.events.length : 0,
+      actionCount: Array.isArray(log.actions) ? log.actions.length : 0,
+      screenshotCount: screenshotFiles.length,
+      hasFinalImage: Boolean(finalImageFile),
+      logFile: storage.logFile,
+      finalImageFile
+    };
+
+    await fs.appendFile(RUN_INDEX_PATH, `${JSON.stringify(indexRow)}\n`, 'utf8');
+
+    res.json({
+      ok: true,
+      storage
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error.message || 'Failed to save run artifacts.'
+    });
+  }
+});
+
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+const server = http.createServer(app);
+
+const browserWss = new WebSocketServer({
+  server,
+  path: '/ws/responses'
+});
+
+browserWss.on('connection', (browserSocket) => {
+  if (!OPENAI_API_KEY) {
+    browserSocket.send(JSON.stringify({
+      type: 'proxy.upstream_error',
+      message: 'Server is missing OPENAI_API_KEY.',
+      error: {
+        code: 'proxy_missing_api_key'
+      }
+    }));
+    setTimeout(() => {
+      if (browserSocket.readyState === WebSocket.OPEN) {
+        browserSocket.close(1011, 'missing api key');
+      }
+    }, 50);
+    return;
+  }
+
+  const upstreamSocket = new WebSocket('wss://api.openai.com/v1/responses', {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`
     }
-    
-    // Record start time for performance measurement
-    const startTime = process.hrtime();
-    
-    // Analyze the canvas
-    const analysis = await analyzeLiveCanvas(canvasState, metrics.previousAnalysis);
-    
-    if (analysis) {
-        // Measure performance
-        const [seconds, nanoseconds] = process.hrtime(startTime);
-        const processingTime = seconds * 1000 + nanoseconds / 1000000;
-        
-        // Adjust timing dynamically based on performance
-        if (processingTime > 1000) {
-            // If processing takes over 1 second, increase interval
-            metrics.analysisInterval = Math.min(5000, metrics.analysisInterval * 1.2);
-        } else if (processingTime < 500) {
-            // If processing is fast, decrease interval
-            metrics.analysisInterval = Math.max(1000, metrics.analysisInterval * 0.8);
-        }
-        
-        // Update metrics
-        metrics.lastAnalysisTime = now;
-        metrics.previousAnalysis = analysis;
-        clientTimingMetrics.set(clientId, metrics);
-        
-        // Send analysis to client
-        ws.send(JSON.stringify({
-            type: 'AI_ANALYSIS',
-            analysis: analysis,
-            processingTime: processingTime,
-            nextAnalysisIn: metrics.analysisInterval
-        }));
-        
-        // Automatically implement suggestions if completionPercentage < 95
-        if (analysis.completionPercentage < 95 && analysis.suggestions && analysis.suggestions.length > 0) {
-            // Implement just one suggestion at a time in live mode
-            const command = analysis.suggestions[0];
-            if (command.endpoint && command.params) {
-                ws.send(JSON.stringify({
-                    type: command.endpoint.replace('/api/', '').toUpperCase(),
-                    ...command.params
-                }));
-            }
-        }
+  });
+
+  let upstreamOpen = false;
+  const queuedClientMessages = [];
+
+  function flushQueuedClientMessages() {
+    while (queuedClientMessages.length > 0 && upstreamSocket.readyState === WebSocket.OPEN) {
+      upstreamSocket.send(queuedClientMessages.shift());
     }
-}
+  }
 
-function broadcastToOthers(sender, data) {
-    console.log(`Broadcasting ${data.type} to other clients...`);
-    let broadcastCount = 0;
-    connectedClients.forEach(client => {
-        if (client !== sender && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(data));
-            broadcastCount++;
+  function closeBrowserWithProxyError(message) {
+    if (browserSocket.readyState === WebSocket.OPEN) {
+      browserSocket.send(JSON.stringify({
+        type: 'proxy.upstream_error',
+        message,
+        error: {
+          code: 'proxy_upstream_error'
         }
-    });
-    console.log(`Broadcasted to ${broadcastCount} clients`);
-}
-
-// API Endpoints
-
-// Get current canvas state
-app.get('/api/canvas', (req, res) => {
-    console.log('\n📥 GET /api/canvas');
-    res.json({ canvasData: canvasState });
-});
-
-// Update canvas with drawing action
-app.post('/api/draw', (req, res) => {
-    console.log('\n📝 POST /api/draw');
-    console.log('Draw action:', req.body);
-    
-    const action = req.body;
-    
-    // Broadcast the drawing action to all connected clients
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'DRAW_ACTION',
-                action: action
-            }));
+      }));
+      setTimeout(() => {
+        if (browserSocket.readyState === WebSocket.OPEN) {
+          browserSocket.close(1011, 'upstream error');
         }
-    });
-
-    res.json({ success: true });
-});
-
-app.post('/api/live-mode', (req, res) => {
-    console.log('\n🔄 POST /api/live-mode');
-    console.log('Live mode:', req.body.enabled);
-    
-    const { enabled } = req.body;
-    
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.liveAnalysisMode = enabled;
-            client.send(JSON.stringify({
-                type: 'LIVE_MODE_UPDATE',
-                enabled: enabled
-            }));
-        }
-    });
-
-    res.json({ success: true });
-});
-
-app.post('/api/streaming-rate', (req, res) => {
-    console.log('\n⏱️ POST /api/streaming-rate');
-    console.log('New rate:', req.body.rate);
-    
-    const { rate } = req.body;
-    
-    // Validate rate (minimum 100ms, maximum 2000ms)
-    const validRate = Math.max(100, Math.min(2000, rate));
-    
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.streamingInterval = validRate;
-            client.send(JSON.stringify({
-                type: 'STREAMING_RATE_UPDATE',
-                rate: validRate
-            }));
-        }
-    });
-
-    res.json({ success: true, rate: validRate });
-});
-
-// Clear canvas
-app.post('/api/clear', (req, res) => {
-    console.log('\n🗑️ POST /api/clear');
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'CLEAR_CANVAS'
-            }));
-        }
-    });
-
-    canvasState = null;
-    clearConversation(); // Clear AI conversation history when canvas is cleared
-    res.json({ success: true });
-});
-
-// Change tool
-app.post('/api/tool', (req, res) => {
-    console.log('\n🔧 POST /api/tool');
-    console.log('New tool:', req.body.tool);
-    
-    const { tool } = req.body;
-    
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'CHANGE_TOOL',
-                tool: tool
-            }));
-        }
-    });
-
-    res.json({ success: true });
-});
-
-// Change color
-app.post('/api/color', (req, res) => {
-    console.log('\n🎨 POST /api/color');
-    console.log('New color:', req.body.color);
-    
-    const { color } = req.body;
-    
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'CHANGE_COLOR',
-                color: color
-            }));
-        }
-    });
-
-    res.json({ success: true });
-});
-
-// Change line width
-app.post('/api/linewidth', (req, res) => {
-    console.log('\n📏 POST /api/linewidth');
-    console.log('New width:', req.body.width);
-    
-    const { width } = req.body;
-    
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'CHANGE_LINE_WIDTH',
-                width: width
-            }));
-        }
-    });
-
-    res.json({ success: true });
-});
-
-// Add new API endpoint for streaming mode
-app.post('/api/streaming-mode', (req, res) => {
-    console.log('\n🌊 POST /api/streaming-mode');
-    console.log('Streaming mode:', req.body);
-    
-    const { enabled, interval, batchSize } = req.body;
-    
-    // Enable/disable streaming mode globally
-    streamingModeEnabled = enabled;
-    
-    // Set batch size if provided
-    if (batchSize) {
-        setStreamingBatchSize(batchSize);
+      }, 50);
     }
-    
-    // Broadcast to all clients
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.streamingMode = enabled;
-            
-            // Update interval if provided
-            if (interval) {
-                client.streamingInterval = Math.max(100, Math.min(2000, interval));
-            }
-            
-            client.send(JSON.stringify({
-                type: 'STREAMING_MODE_UPDATE',
-                enabled: enabled,
-                interval: client.streamingInterval
-            }));
+  }
+
+  upstreamSocket.on('open', () => {
+    upstreamOpen = true;
+    if (browserSocket.readyState === WebSocket.OPEN) {
+      browserSocket.send(JSON.stringify({
+        type: 'proxy.connected'
+      }));
+    }
+    flushQueuedClientMessages();
+  });
+
+  upstreamSocket.on('message', (data) => {
+    if (browserSocket.readyState !== WebSocket.OPEN) return;
+    browserSocket.send(data.toString());
+  });
+
+  upstreamSocket.on('error', (error) => {
+    closeBrowserWithProxyError(`OpenAI upstream WebSocket error: ${error.message || 'unknown error'}`);
+  });
+
+  upstreamSocket.on('close', (code, reasonBuffer) => {
+    const reason = Buffer.isBuffer(reasonBuffer) ? reasonBuffer.toString('utf8') : String(reasonBuffer || '');
+    if (browserSocket.readyState === WebSocket.OPEN) {
+      browserSocket.send(JSON.stringify({
+        type: 'proxy.upstream_closed',
+        code,
+        reason
+      }));
+      setTimeout(() => {
+        if (browserSocket.readyState === WebSocket.OPEN) {
+          browserSocket.close(1000, 'upstream closed');
         }
-    });
+      }, 50);
+    }
+  });
 
-    res.json({ 
-        success: true, 
-        enabled: streamingModeEnabled,
-        batchSize: batchSize || 3
-    });
-});
+  browserSocket.on('message', (data) => {
+    const text = data.toString();
 
-// Add a new API endpoint for drawing failures
-app.post('/api/drawing_failed', (req, res) => {
-    console.log('\n❌ POST /api/drawing_failed');
-    console.log('Drawing failed:', req.body);
-    
-    // Broadcast the failure to all connected clients
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'DRAWING_FAILED',
-                reason: req.body.reason || 'Unknown error',
-                recoverable: req.body.recoverable || false,
-                phase: req.body.phase,
-                prompt: req.body.prompt
-            }));
-        }
-    });
-
-    res.json({ success: true });
-});
-
-// Helper function to execute drawing commands
-async function executeCommands(commands, ws) {
-    // Track if we need to continue drawing
-    let shouldContinue = false;
-    let completionPercentage = 0;
-    let phaseChange = false;
-    
-    console.log(`Executing ${commands.length} commands...`);
-    
-    // Add validation layer
-    const validatedCommands = commands.map(command => {
-        if (command.endpoint === '/api/draw') {
-            return {
-                ...command,
-                params: {
-                    tool: command.params.tool || 'pencil',
-                    color: validateColor(command.params.color),
-                    lineWidth: clamp(command.params.lineWidth, 1, 50),
-                    startX: clamp(command.params.startX, 0, 800),
-                    startY: clamp(command.params.startY, 0, 600),
-                    x: clamp(command.params.x, 0, 800),
-                    y: clamp(command.params.y, 0, 600)
-                }
-            };
-        }
-        return command;
-    });
-    
-    // Check for drawing failure
-    const failureCommand = validatedCommands.find(cmd => cmd.endpoint === '/api/drawing_failed');
-    if (failureCommand) {
-        console.log('Drawing failure detected:', failureCommand.params);
-        
-        // Notify clients of the failure
-        wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                    type: 'DRAWING_FAILED',
-                    reason: failureCommand.params.reason || 'Unknown drawing error',
-                    recoverable: failureCommand.params.recoverable || false,
-                    phase: failureCommand.params.phase,
-                    prompt: failureCommand.params.prompt
-                }));
-            }
-        });
-        
-        console.log('Drawing failure notification sent to clients');
-        return;
+    if (!upstreamOpen || upstreamSocket.readyState === WebSocket.CONNECTING) {
+      queuedClientMessages.push(text);
+      return;
     }
 
-    // Use validatedCommands instead of raw commands
-    for (const command of validatedCommands) {
-        if (command.endpoint && command.params) {
-            console.log('Executing command:', command.endpoint, JSON.stringify(command.params));
-            
-            // Check if this is a next_phase command
-            if (command.endpoint === '/api/next_phase') {
-                const completedPhase = command.params.completedPhase || ws.currentPhase;
-                const nextPhase = completedPhase + 1;
-                
-                if (nextPhase <= 3) {
-                    ws.currentPhase = nextPhase;
-                    currentDrawingPhase = nextPhase;
-                    const completionPercentage = command.params.completionPercentage || 0;
-                    
-                    console.log(`🔄 Advancing to Phase ${nextPhase} (${completionPercentage}% complete)`);
-                    
-                    // Notify clients of phase change
-                    wss.clients.forEach(client => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'PHASE_CHANGE',
-                                phase: nextPhase,
-                                completionPercentage: completionPercentage
-                            }));
-                        }
-                    });
-                    
-                    // Pause briefly to allow UI updates
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    
-                    // Automatically continue to the next phase
-                    shouldContinue = true;
-                    phaseChange = true;
-                }
-                continue;
-            }
-            
-            // Check if this is a continue command
-            if (command.endpoint === '/api/continue') {
-                shouldContinue = true;
-                const completionPercentage = command.params.completionPercentage || 0;
-                
-                // Update phase if specified
-                if (command.params.currentPhase) {
-                    ws.currentPhase = command.params.currentPhase;
-                    currentDrawingPhase = command.params.currentPhase;
-                }
-                
-                console.log(`Drawing completion: ${completionPercentage}%, Phase: ${ws.currentPhase}`);
-                
-                // Send completion status to client
-                wss.clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'COMPLETION_UPDATE',
-                            percentage: completionPercentage,
-                            phase: ws.currentPhase
-                        }));
-                    }
-                });
-                
-                // If completion is less than 95%, schedule continuation
-                if (completionPercentage < 95) {
-                    console.log('Drawing is incomplete, will continue...');
-                } else {
-                    console.log('Drawing is nearly complete!');
-                    shouldContinue = false;
-                }
-                continue;
-            }
-            
-            // Execute each command
-            wss.clients.forEach(client => {
-                if (client.readyState === WebSocket.OPEN) {
-                    // Map the endpoint to the client-expected message type
-                    let messageType;
-                    switch (command.endpoint) {
-                        case '/api/clear':
-                            messageType = 'CLEAR_CANVAS';
-                            client.send(JSON.stringify({ type: messageType }));
-                            break;
-                        case '/api/tool':
-                            messageType = 'CHANGE_TOOL';
-                            client.send(JSON.stringify({ 
-                                type: messageType,
-                                tool: command.params.tool 
-                            }));
-                            break;
-                        case '/api/color':
-                            messageType = 'CHANGE_COLOR';
-                            client.send(JSON.stringify({ 
-                                type: messageType,
-                                color: command.params.color 
-                            }));
-                            break;
-                        case '/api/linewidth':
-                            messageType = 'CHANGE_LINE_WIDTH';
-                            client.send(JSON.stringify({ 
-                                type: messageType,
-                                width: command.params.width 
-                            }));
-                            break;
-                        case '/api/draw':
-                            messageType = 'DRAW_ACTION';
-                            client.send(JSON.stringify({ 
-                                type: messageType,
-                                action: command.params
-                            }));
-                            break;
-                        case '/api/pause':
-                            messageType = 'PAUSE';
-                            client.send(JSON.stringify({ 
-                                type: messageType,
-                                duration: command.params.duration 
-                            }));
-                            console.log(`Pausing for ${command.params.duration}ms to capture canvas state`);
-                            break;
-                        default:
-                            console.log('Unknown command endpoint:', command.endpoint);
-                    }
-                    console.log(`Sent ${messageType} to client`);
-                }
-            });
-            // Add delay between commands
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-            // Add additional delay for pause command
-            if (command.endpoint === '/api/pause') {
-                console.log('Waiting for canvas state update...');
-                await new Promise(resolve => setTimeout(resolve, command.params.duration || 1000));
-                
-                // If we've paused and should continue based on previous continue command
-                if (shouldContinue && completionPercentage < 95) {
-                    console.log('Auto-continuing drawing after pause...');
-                    
-                    // If phase has changed, we need special handling
-                    if (phaseChange) {
-                        console.log(`Starting phase ${ws.currentPhase} drawing...`);
-                        phaseChange = false;
-                    }
-                    
-                    // We'll trigger the continue drawing logic in the client
-                    wss.clients.forEach(client => {
-                        if (client.readyState === WebSocket.OPEN) {
-                            client.send(JSON.stringify({
-                                type: 'TRIGGER_CONTINUE',
-                                phase: ws.currentPhase
-                            }));
-                        }
-                    });
-                    
-                    // Reset flag to avoid multiple continuations from one command
-                    shouldContinue = false;
-                }
-            }
-        }
+    if (upstreamSocket.readyState === WebSocket.OPEN) {
+      upstreamSocket.send(text);
     }
-    console.log('Command execution complete');
-}
+  });
 
-// Helper functions
-const clamp = (value, min, max) => 
-    Math.round(Math.max(min, Math.min(max, Number(value) || 0)));
-const validateColor = (color) => 
-    /^#[0-9A-F]{6}$/i.test(color) ? color : '#000000';
-
-// Intelligent function to process the next queued canvas update
-async function processNextCanvasUpdate() {
-    // Check if there's anything in the queue
-    if (canvasUpdateQueue.size === 0) {
-        console.log('Canvas update queue empty');
-        return;
+  browserSocket.on('close', () => {
+    if (upstreamSocket.readyState === WebSocket.OPEN || upstreamSocket.readyState === WebSocket.CONNECTING) {
+      upstreamSocket.close(1000, 'browser disconnected');
     }
-    
-    // Get the next client from the queue
-    const [ws, updateData] = canvasUpdateQueue.entries().next().value;
-    
-    // Clear this client's entry from the queue
-    canvasUpdateQueue.delete(ws);
-    
-    // Only process if we have a valid client and it's in streaming mode
-    if (ws && ws.readyState === WebSocket.OPEN && ws.streamingMode && ws.originalPrompt) {
-        // Mark as processing to prevent multiple simultaneous executions
-        ws.isProcessingCommand = true;
-        
-        try {
-            // Notify client we're starting command execution
-            ws.send(JSON.stringify({
-                type: 'STREAMING_COMMAND_START'
-            }));
-            
-            const startTime = Date.now();
-            
-            // Get AI commands for the current canvas state
-            const streamingCommands = await streamingModeUpdate(
-                updateData.canvasData, 
-                ws.originalPrompt, 
-                ws.currentPhase
-            );
-            
-            if (streamingCommands && streamingCommands.length > 0) {
-                console.log(`Executing ${streamingCommands.length} streaming commands`);
-                await executeCommands(streamingCommands, ws);
-                
-                // Notify client that command execution is complete
-                ws.send(JSON.stringify({
-                    type: 'STREAMING_COMMAND_COMPLETE'
-                }));
-            } else {
-                console.log('No streaming commands received or drawing complete');
-                ws.streamingMode = false;
-                ws.send(JSON.stringify({
-                    type: 'STREAMING_COMPLETE'
-                }));
-            }
-            
-            // Dynamically adjust streaming interval based on processing time
-            const processingTime = Date.now() - startTime;
-            ws.streamingInterval = Math.max(
-                MIN_STREAMING_INTERVAL,
-                Math.min(MAX_STREAMING_INTERVAL, processingTime * 1.2)
-            );
-            console.log(`Adjusted streaming interval to ${ws.streamingInterval}ms based on processing time of ${processingTime}ms`);
-            
-        } catch (error) {
-            console.error('Error processing canvas update:', error);
-            ws.send(JSON.stringify({
-                type: 'ERROR',
-                message: 'Error processing canvas update: ' + error.message
-            }));
-        } finally {
-            // Mark as no longer processing
-            ws.isProcessingCommand = false;
-            
-            // Check if there are more updates in the queue (from any client)
-            if (canvasUpdateQueue.size > 0) {
-                console.log('Processing next queued canvas update');
-                setTimeout(processNextCanvasUpdate, 100); // Short delay before processing next update
-            }
-        }
-    }
-}
+  });
 
-const PORT = process.env.PORT || 3000;
+  browserSocket.on('error', () => {
+    if (upstreamSocket.readyState === WebSocket.OPEN || upstreamSocket.readyState === WebSocket.CONNECTING) {
+      upstreamSocket.close(1000, 'browser socket error');
+    }
+  });
+});
+
 server.listen(PORT, () => {
-    console.log(`\n🚀 Server running on port ${PORT}`);
-}); 
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Responses WS proxy path: ws://localhost:${PORT}/ws/responses`);
+  console.log(`Default model: ${DEFAULT_RESPONSES_MODEL}`);
+});

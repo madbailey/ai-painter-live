@@ -1,39 +1,75 @@
 # AI Painter Live
 
-AI Painter Live is a conceptual project focused on augmenting AI art creation through live visual feedback. It allows users to draw on a shared canvas and interact with a generative AI to collaboratively produce artwork.
+AI Painter Live is a browser-based paint app where an autonomous LLM paints by calling local drawing tools and requesting screenshots on demand.
 
-## Core Features
+## Current Architecture
 
--   **Interactive Canvas**: Provides standard drawing tools such as pencil, brush, shape tools (rectangle, circle), fill, spray, and an eraser.
--   **Customization**: Users can select colors and adjust line widths.
--   **AI Collaboration**: Users can input text prompts to guide a generative AI (powered by Google's Generative AI SDK) in drawing on the canvas.
--   **Real-time Updates**: Changes made by users or the AI are reflected in real-time for all connected clients.
+- Frontend (`index.html`, `styles.css`, `script.js`)
+  - Human drawing tools (pencil, brush, rectangle, circle, fill, spray, eraser)
+  - AI run controls (prompt, model, temperature, time limit, stop button)
+  - Browser-to-local WebSocket connection
+  - Local tool runtime for model function calls
+  - Deterministic run log and replay
+  - Automatic run artifact persistence trigger at run end
+- Backend (`server.js`)
+  - Static file hosting
+  - Local WebSocket proxy at `/ws/responses` that connects to OpenAI Responses API WebSocket mode (`wss://api.openai.com/v1/responses`) with server-side auth
+  - Run persistence API (`POST /api/runs/save`) that writes logs and images to disk
+  - Run index API (`GET /api/runs/index`) for historical tracking
 
-## Technical Overview
+## Safety + Control Guards
 
-The application is structured as follows:
+- Single AI painter session at a time
+- Exclusive control mode: `Human` or `AI` (not both)
+- Manual stop button
+- Hard max run timer (seconds)
+- `finish` tool for model-controlled termination
+- `clear_canvas` tool is blocked by default (must be manually enabled)
 
-*   **Frontend**: (`index.html`, `script.js`, `styles.css`) - The client-side interface built with HTML, CSS, and JavaScript. It manages user interactions, local drawing operations, and WebSocket communication with the backend.
-*   **Backend**: (`server.js`) - A Node.js server using Express. It handles WebSocket connections (`ws`) for real-time bidirectional communication, manages canvas state, and interfaces with the AI service.
-*   **AI Service Integration**: (`services/gemini.js`) - This module is responsible for communicating with Google's Generative AI SDK, processing user prompts, and translating AI responses into drawable commands.
-*   **Real-time Streaming**: The application supports a streaming mode where the AI can provide drawing instructions more continuously based on canvas updates, allowing for more fluid interaction.
+## Setup
 
-## Setup and Execution
+1. Install dependencies:
 
-To run the project locally:
+```bash
+npm install
+```
 
-1.  **Prerequisites**: Ensure Node.js is installed.
-2.  **Clone Repository**: Obtain a local copy of the project.
-3.  **Install Dependencies**: Navigate to the project directory and run `npm install`. This will install necessary packages including Express, ws, and the Google Generative AI SDK.
-4.  **API Key Configuration**: A Google AI API key is required. The `.gitignore` file indicates the use of a `.env` file for environment variables. Create a `.env` file in the root directory and add your API key (e.g., `API_KEY=YOUR_API_KEY_HERE`). Refer to `services/gemini.js` for the specific environment variable name if needed.
-5.  **Start Server**: Execute `npm start` to run the application. For development with automatic server restarts on file changes, use `npm run dev`.
-6.  **Access Application**: Open a web browser and navigate to the specified local address (typically `http://localhost:3000`).
+2. Create `.env` in project root:
 
-## Key Code Components
+```env
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_RESPONSES_MODEL=gpt-5.2
+PORT=3000
+```
 
-For those interested in exploring the codebase:
+3. Start the app:
 
-*   `script.js`: Contains the client-side logic for drawing, UI event handling, and WebSocket message processing.
-*   `server.js`: Implements the backend server, WebSocket management, and coordination of AI drawing commands.
-*   `services/gemini.js`: Houses the integration with the Google Generative AI service.
-*   `index.html`: Defines the structure of the web interface.
+```bash
+npm start
+```
+
+4. Open:
+
+`http://localhost:3000`
+
+## Running an AI Paint Session
+
+1. Enter prompt.
+2. Set model, temperature, and max run seconds.
+3. Click `Start AI Run`.
+4. Click `Stop` at any time to cancel.
+5. After completion, artifacts are autosaved under `logs/`:
+   - `logs/[model]_[YYYYMMDD_HHMMSS].json`
+   - `logs/images/[model]_[YYYYMMDD_HHMMSS]_final.png`
+   - `logs/images/[model]_[YYYYMMDD_HHMMSS]_shot_###.jpg` (AI screenshot checkpoints)
+   - `logs/run_index.jsonl` (one metadata row per run)
+6. Optional local actions in UI:
+   - `Download Last Run Log`
+   - `Replay Last Run`
+
+## Notes
+
+- OpenAI API authentication stays server-side in the WS proxy; the browser never receives your API key.
+- Run logs sanitize image payloads in event traces to avoid large data blobs.
+- Replay uses recorded draw actions and deterministic seeded spray behavior.
+- Server-side autosave stores full run JSON and image artifacts for future analysis.

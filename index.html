@@ -1,42 +1,112 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Paint</title>
-    <link rel="stylesheet" href="styles.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Painter Live</title>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="container">
-        <div class="toolbar">
-            <div class="tool-section">
-                <button id="pencil" class="tool active">✏️ Pencil</button>
-                <button id="brush" class="tool">🖌️ Brush</button>
-                <button id="rectangle" class="tool">⬜ Rectangle</button>
-                <button id="circle" class="tool">⭕ Circle</button>
-                <button id="fill" class="tool">🪣 Fill</button>
-                <button id="spray" class="tool">🧴 Spray</button>
-                <button id="eraser" class="tool">🧹 Eraser</button>
-            </div>
-            <div class="tool-section">
-                <input type="color" id="colorPicker" value="#000000">
-                <label for="colorPicker">Color</label>
-            </div>
-            <div class="tool-section">
-                <input type="range" id="lineWidth" min="1" max="50" value="5">
-                <label for="lineWidth">Line Width</label>
-            </div>
-            <div class="tool-section">
-                <button id="clear">🗑️ Clear</button>
-                <button id="save">💾 Save</button>
-            </div>
-        </div>
-        <canvas id="canvas"></canvas>
-        <div class="ai-control">
-            <textarea id="aiPrompt" placeholder="Enter prompt..."></textarea>
-            <button id="sendPrompt">Send</button>
-        </div>
-    </div>
-    <script src="script.js"></script>
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <h1>AI Painter Live</h1>
+        <p>Autonomous canvas agent using OpenAI Responses API (WebSocket mode).</p>
+      </div>
+      <div id="modeBadge" class="mode-badge mode-human">Mode: Human</div>
+    </header>
+
+    <main class="workspace">
+      <aside class="control-panel">
+        <section class="panel-card">
+          <h2>Paint Tools</h2>
+          <div class="tool-grid">
+            <button id="pencil" class="tool active" type="button">Pencil</button>
+            <button id="brush" class="tool" type="button">Brush</button>
+            <button id="rectangle" class="tool" type="button">Rectangle</button>
+            <button id="circle" class="tool" type="button">Circle</button>
+            <button id="fill" class="tool" type="button">Fill</button>
+            <button id="spray" class="tool" type="button">Spray</button>
+            <button id="eraser" class="tool" type="button">Eraser</button>
+          </div>
+
+          <div class="field-group">
+            <label for="colorPicker">Color</label>
+            <input id="colorPicker" type="color" value="#000000">
+          </div>
+
+          <div class="field-group">
+            <label for="lineWidth">Line Width</label>
+            <input id="lineWidth" type="range" min="1" max="50" value="5">
+          </div>
+
+          <div class="action-row">
+            <button id="clear" type="button">Clear</button>
+            <button id="save" type="button">Save PNG</button>
+          </div>
+        </section>
+
+        <section class="panel-card">
+          <h2>AI Run</h2>
+          <div class="field-group">
+            <label for="aiPrompt">Prompt</label>
+            <textarea id="aiPrompt" placeholder="Describe what the agent should paint..."></textarea>
+          </div>
+
+          <div class="field-group">
+            <label for="modelInput">Model</label>
+            <input id="modelInput" type="text" value="gpt-5.2" spellcheck="false">
+          </div>
+
+          <div class="field-group">
+            <label for="temperatureInput">Temperature <span id="temperatureValue">1.0</span></label>
+            <input id="temperatureInput" type="range" min="0" max="2" step="0.1" value="1.0">
+          </div>
+
+          <div class="field-group">
+            <label for="maxRunSeconds">Max Run Seconds</label>
+            <input id="maxRunSeconds" type="number" min="15" max="1800" value="120">
+          </div>
+
+          <label class="checkbox-row">
+            <input id="allowClearTool" type="checkbox">
+            Allow agent `clear_canvas` tool (discouraged)
+          </label>
+
+          <label class="checkbox-row">
+            <input id="gridForScreenshots" type="checkbox" checked>
+            Add coordinate grid when agent requests screenshot
+          </label>
+
+          <div class="action-row">
+            <button id="startAi" type="button">Start AI Run</button>
+            <button id="stopAi" type="button" disabled>Stop</button>
+          </div>
+
+          <div class="run-meta">
+            <div id="runTimer">Timer: --</div>
+            <div id="aiStatus">Status: idle</div>
+          </div>
+
+          <pre id="assistantText" class="assistant-text"></pre>
+        </section>
+
+        <section class="panel-card">
+          <h2>Run Log</h2>
+          <div class="action-row">
+            <button id="downloadLog" type="button" disabled>Download Last Run Log</button>
+            <button id="replayRun" type="button" disabled>Replay Last Run</button>
+          </div>
+          <div id="autosaveStatus" class="autosave-status">Autosave: waiting for next run.</div>
+        </section>
+      </aside>
+
+      <section class="canvas-stage">
+        <canvas id="canvas" width="800" height="600"></canvas>
+      </section>
+    </main>
+  </div>
+
+  <script src="script.js"></script>
 </body>
-</html> 
+</html>
