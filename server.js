@@ -220,11 +220,26 @@ app.post('/api/runs/save', async (req, res) => {
     const logPath = path.join(LOGS_DIR, `${baseName}.json`);
     await fs.writeFile(logPath, JSON.stringify(logToPersist, null, 2), 'utf8');
 
+    const settings = log.settings && typeof log.settings === 'object'
+      ? log.settings
+      : {};
+    const evalMeta = settings.eval && typeof settings.eval === 'object'
+      ? settings.eval
+      : {};
+
     const indexRow = {
       savedAt,
       runId: log.runId || null,
       model,
       prompt: typeof log.prompt === 'string' ? log.prompt : null,
+      maxRunSeconds: Number.isFinite(Number(log.maxRunSeconds)) ? Number(log.maxRunSeconds) : null,
+      allowClearTool: typeof settings.allowClearTool === 'boolean' ? settings.allowClearTool : null,
+      gridForScreenshots: typeof settings.gridForScreenshots === 'boolean' ? settings.gridForScreenshots : null,
+      evalTag: typeof evalMeta.tag === 'string' ? evalMeta.tag : null,
+      evalMatrixId: typeof evalMeta.matrixId === 'string' ? evalMeta.matrixId : null,
+      evalRow: Number.isFinite(Number(evalMeta.row)) ? Number(evalMeta.row) : null,
+      evalComboIndex: Number.isFinite(Number(evalMeta.comboIndex)) ? Number(evalMeta.comboIndex) : null,
+      evalRepeat: Number.isFinite(Number(evalMeta.repeat)) ? Number(evalMeta.repeat) : null,
       startedAt: log.startedAt || null,
       endedAt: log.endedAt || null,
       finalReason: log.finalReason || null,

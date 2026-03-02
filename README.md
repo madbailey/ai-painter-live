@@ -6,7 +6,8 @@ AI Painter Live is a browser-based paint app where an autonomous LLM paints by c
 
 - Frontend (`index.html`, `styles.css`, `script.js`)
   - Human drawing tools (pencil, brush, rectangle, circle, fill, spray, eraser)
-  - AI run controls (prompt, model, temperature, time limit, stop button)
+  - AI run controls (prompt, model, time limit, stop button)
+  - Eval matrix runner (batch combinations across prompts + settings)
   - Browser-to-local WebSocket connection
   - Local tool runtime for model function calls
   - Deterministic run log and replay
@@ -54,8 +55,10 @@ npm start
 
 ## Running an AI Paint Session
 
+Use the top **Single Run / Eval Matrix** tabs in the left panel to switch workflows.
+
 1. Enter prompt.
-2. Set model, temperature, and max run seconds.
+2. Set model and max run seconds.
 3. Click `Start AI Run`.
 4. Click `Stop` at any time to cancel.
 5. After completion, artifacts are autosaved under `logs/`:
@@ -66,6 +69,45 @@ npm start
 6. Optional local actions in UI:
    - `Download Last Run Log`
    - `Replay Last Run`
+
+## Eval Matrix Runner
+
+Use the **Eval Matrix** panel to run batched experiments over:
+- Prompts (one per line)
+- Models
+- Max run seconds
+- Screenshot grid mode (`true/false`)
+- `clear_canvas` permission mode (`true/false`)
+- Repeats per combination
+- Pause between runs
+- Pause between model batches
+
+Runs are grouped by model batch automatically (all combinations for one model, then next model).
+
+Each eval run is still autosaved to `logs/` like normal runs, and now includes run settings + eval metadata in `log.settings`.
+
+You can export a run-level CSV directly from the UI with **Download Eval CSV**.
+
+## Eval Report CLI
+
+Aggregate saved runs from `logs/run_index.jsonl`:
+
+```bash
+npm run eval:report
+```
+
+Common filters:
+
+```bash
+# Only one eval tag
+npm run eval:report -- --tag portrait-grid-a
+
+# Custom grouping
+npm run eval:report -- --group-by model,prompt,maxRunSeconds
+
+# Export grouped CSV
+npm run eval:report -- --tag portrait-grid-a --csv logs/reports/portrait-grid-a.csv
+```
 
 ## Notes
 

@@ -10,57 +10,61 @@
   <div class="app-shell">
     <header class="app-header">
       <div>
-        <h1>AI Painter Live</h1>
-        <p>Autonomous canvas agent using OpenAI Responses API (WebSocket mode).</p>
+        <h1>AI Painter Eval</h1>
+        <p>Evaluate and compare model painting capabilities.</p>
       </div>
-      <div id="modeBadge" class="mode-badge mode-human">Mode: Human</div>
     </header>
 
     <main class="workspace">
       <aside class="control-panel">
-        <section class="panel-card">
-          <h2>Paint Tools</h2>
-          <div class="tool-grid">
-            <button id="pencil" class="tool active" type="button">Pencil</button>
-            <button id="brush" class="tool" type="button">Brush</button>
-            <button id="rectangle" class="tool" type="button">Rectangle</button>
-            <button id="circle" class="tool" type="button">Circle</button>
-            <button id="fill" class="tool" type="button">Fill</button>
-            <button id="spray" class="tool" type="button">Spray</button>
-            <button id="eraser" class="tool" type="button">Eraser</button>
-          </div>
+        <div class="panel-tabs" role="tablist" aria-label="Workflow mode">
+          <button
+            id="tabRunMode"
+            class="panel-tab is-active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            data-panel-tab="run"
+          >
+            Single Run
+          </button>
+          <button
+            id="tabEvalMode"
+            class="panel-tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            data-panel-tab="eval"
+          >
+            Eval Matrix
+          </button>
+        </div>
 
-          <div class="field-group">
-            <label for="colorPicker">Color</label>
-            <input id="colorPicker" type="color" value="#000000">
-          </div>
-
-          <div class="field-group">
-            <label for="lineWidth">Line Width</label>
-            <input id="lineWidth" type="range" min="1" max="50" value="5">
-          </div>
-
-          <div class="action-row">
-            <button id="clear" type="button">Clear</button>
-            <button id="save" type="button">Save PNG</button>
-          </div>
-        </section>
-
-        <section class="panel-card">
-          <h2>AI Run</h2>
+        <section class="panel-card" data-panel-mode="run">
+          <h2>Run Config</h2>
           <div class="field-group">
             <label for="aiPrompt">Prompt</label>
             <textarea id="aiPrompt" placeholder="Describe what the agent should paint..."></textarea>
           </div>
 
           <div class="field-group">
-            <label for="modelInput">Model</label>
-            <input id="modelInput" type="text" value="gpt-5.2" spellcheck="false">
+            <label for="modelSelect">Model</label>
+            <select id="modelSelect">
+              <option value="gpt-5.2">gpt-5.2</option>
+              <option value="gpt-5-mini">gpt-5-mini</option>
+              <option value="gpt-5-nano">gpt-5-nano</option>
+              <option value="__custom__">Custom...</option>
+            </select>
+            <input id="modelCustom" type="text" placeholder="Enter custom model ID" style="display:none" spellcheck="false">
           </div>
 
           <div class="field-group">
-            <label for="temperatureInput">Temperature <span id="temperatureValue">1.0</span></label>
-            <input id="temperatureInput" type="range" min="0" max="2" step="0.1" value="1.0">
+            <label for="instructionPreambleAddon">System preamble add-on (optional)</label>
+            <textarea
+              id="instructionPreambleAddon"
+              class="compact-textarea"
+              placeholder="Extra high-level guidance inserted before the standard painting workflow..."
+            ></textarea>
           </div>
 
           <div class="field-group">
@@ -89,22 +93,108 @@
           </div>
 
           <pre id="assistantText" class="assistant-text"></pre>
-        </section>
 
-        <section class="panel-card">
-          <h2>Run Log</h2>
-          <div class="action-row">
+          <div class="action-row" style="margin-top:8px">
             <button id="downloadLog" type="button" disabled>Download Last Run Log</button>
-            <button id="replayRun" type="button" disabled>Replay Last Run</button>
           </div>
           <div id="autosaveStatus" class="autosave-status">Autosave: waiting for next run.</div>
         </section>
+
+        <section class="panel-card" data-panel-mode="eval">
+          <h2>Eval Matrix</h2>
+          <p class="panel-note">Batch-run parameter combinations and compare outcomes.</p>
+
+          <div class="field-group">
+            <label for="evalPrompts">Prompts (one per line)</label>
+            <textarea id="evalPrompts" placeholder="a portrait of a woman&#10;a house cat"></textarea>
+          </div>
+
+          <div class="field-group">
+            <label>Models</label>
+            <div id="evalModelCheckboxes" class="checkbox-group">
+              <label class="checkbox-row"><input type="checkbox" value="gpt-5.2" checked> gpt-5.2</label>
+              <label class="checkbox-row"><input type="checkbox" value="gpt-5-mini"> gpt-5-mini</label>
+              <label class="checkbox-row"><input type="checkbox" value="gpt-5-nano"> gpt-5-nano</label>
+            </div>
+            <input id="evalModelsCustom" type="text" placeholder="Additional models (comma-separated)" spellcheck="false">
+          </div>
+
+          <div class="field-group">
+            <label for="evalMaxRunSeconds">Max run seconds values (comma-separated)</label>
+            <input id="evalMaxRunSeconds" type="text" value="120" spellcheck="false">
+          </div>
+
+          <div class="field-group">
+            <label for="evalGridModes">Grid for screenshots (comma-separated true/false)</label>
+            <input id="evalGridModes" type="text" value="true,false" spellcheck="false">
+          </div>
+
+          <div class="field-group">
+            <label for="evalAllowClearModes">Allow clear_canvas (comma-separated true/false)</label>
+            <input id="evalAllowClearModes" type="text" value="false" spellcheck="false">
+          </div>
+
+          <div class="field-group">
+            <label for="evalRepeats">Repeats per combo</label>
+            <input id="evalRepeats" type="number" min="1" max="20" value="1">
+          </div>
+
+          <div class="field-group">
+            <label for="evalPauseMs">Pause between runs (ms)</label>
+            <input id="evalPauseMs" type="number" min="0" max="60000" value="1200">
+          </div>
+
+          <div class="field-group">
+            <label for="evalModelBatchPauseMs">Pause between model batches (ms)</label>
+            <input id="evalModelBatchPauseMs" type="number" min="0" max="300000" value="15000">
+          </div>
+
+          <div class="field-group">
+            <label for="evalTag">Eval tag</label>
+            <input id="evalTag" type="text" placeholder="optional label (e.g. portrait-grid-a)">
+          </div>
+
+          <div class="field-group">
+            <label for="evalInstructionPreambleAddon">Eval preamble add-on (optional)</label>
+            <textarea
+              id="evalInstructionPreambleAddon"
+              class="compact-textarea"
+              placeholder="Optional. If blank, the run preamble add-on is used."
+            ></textarea>
+          </div>
+
+          <label class="checkbox-row">
+            <input id="evalClearCanvasEachRun" type="checkbox" checked>
+            Clear canvas before each eval run
+          </label>
+
+          <div class="action-row action-row-3">
+            <button id="startEvalMatrix" type="button">Start Matrix</button>
+            <button id="stopEvalMatrix" type="button" disabled>Stop Matrix</button>
+            <button id="downloadEvalCsv" type="button" disabled>Download Eval CSV</button>
+          </div>
+
+          <div id="evalStatus" class="autosave-status">Eval: idle.</div>
+        </section>
       </aside>
 
-      <section class="canvas-stage">
-        <canvas id="canvas" width="800" height="600"></canvas>
-      </section>
+      <div class="main-content">
+        <section class="canvas-stage">
+          <canvas id="canvas" width="800" height="600"></canvas>
+        </section>
+
+        <section id="resultsGallery" class="results-gallery"></section>
+      </div>
     </main>
+  </div>
+
+  <!-- Overlay for full-size result view -->
+  <div id="resultCardOverlay" class="result-card-overlay" style="display:none">
+    <div class="overlay-inner">
+      <button id="overlayClose" class="overlay-close" type="button">&times;</button>
+      <img id="overlayImage" src="" alt="Full size result">
+      <div id="overlayMeta" class="overlay-meta"></div>
+    </div>
   </div>
 
   <script src="script.js"></script>

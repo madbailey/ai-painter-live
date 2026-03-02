@@ -2,9 +2,6 @@ const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
 const VALID_TOOLS = ['pencil', 'brush', 'rectangle', 'circle', 'fill', 'spray', 'eraser'];
 const DEFAULT_MODEL = 'gpt-5.2';
-const DEFAULT_TEMPERATURE = 1.0;
-const MIN_TEMPERATURE = 0;
-const MAX_TEMPERATURE = 2;
 const DEFAULT_MAX_RUN_SECONDS = 120;
 const MIN_MAX_RUN_SECONDS = 15;
 const MAX_MAX_RUN_SECONDS = 1800;
@@ -18,20 +15,19 @@ const SCREENSHOT_JPEG_QUALITY = 0.74;
 const MAX_AUTOSAVE_SCREENSHOTS = 80;
 const UNDO_MAX_SNAPSHOTS = 20;
 
+const AVAILABLE_MODELS = ['gpt-5.2', 'gpt-5-mini', 'gpt-5-nano'];
+
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
 const ui = {
-  modeBadge: document.getElementById('modeBadge'),
-  toolButtons: Array.from(document.querySelectorAll('.tool')),
-  colorPicker: document.getElementById('colorPicker'),
-  lineWidth: document.getElementById('lineWidth'),
-  clearButton: document.getElementById('clear'),
-  saveButton: document.getElementById('save'),
+  tabRunMode: document.getElementById('tabRunMode'),
+  tabEvalMode: document.getElementById('tabEvalMode'),
+  panelModeTabs: Array.from(document.querySelectorAll('[data-panel-tab]')),
+  panelModeSections: Array.from(document.querySelectorAll('[data-panel-mode]')),
   aiPrompt: document.getElementById('aiPrompt'),
-  modelInput: document.getElementById('modelInput'),
-  temperatureInput: document.getElementById('temperatureInput'),
-  temperatureValue: document.getElementById('temperatureValue'),
+  modelSelect: document.getElementById('modelSelect'),
+  modelCustom: document.getElementById('modelCustom'),
   maxRunSeconds: document.getElementById('maxRunSeconds'),
   allowClearTool: document.getElementById('allowClearTool'),
   gridForScreenshots: document.getElementById('gridForScreenshots'),
@@ -41,12 +37,32 @@ const ui = {
   aiStatus: document.getElementById('aiStatus'),
   assistantText: document.getElementById('assistantText'),
   downloadLog: document.getElementById('downloadLog'),
-  replayRun: document.getElementById('replayRun'),
-  autosaveStatus: document.getElementById('autosaveStatus')
+  autosaveStatus: document.getElementById('autosaveStatus'),
+  evalPrompts: document.getElementById('evalPrompts'),
+  evalModelCheckboxes: document.getElementById('evalModelCheckboxes'),
+  evalModelsCustom: document.getElementById('evalModelsCustom'),
+  evalMaxRunSeconds: document.getElementById('evalMaxRunSeconds'),
+  evalGridModes: document.getElementById('evalGridModes'),
+  evalAllowClearModes: document.getElementById('evalAllowClearModes'),
+  evalRepeats: document.getElementById('evalRepeats'),
+  evalPauseMs: document.getElementById('evalPauseMs'),
+  evalModelBatchPauseMs: document.getElementById('evalModelBatchPauseMs'),
+  evalTag: document.getElementById('evalTag'),
+  evalClearCanvasEachRun: document.getElementById('evalClearCanvasEachRun'),
+  startEvalMatrix: document.getElementById('startEvalMatrix'),
+  stopEvalMatrix: document.getElementById('stopEvalMatrix'),
+  downloadEvalCsv: document.getElementById('downloadEvalCsv'),
+  evalStatus: document.getElementById('evalStatus'),
+  resultsGallery: document.getElementById('resultsGallery'),
+  resultCardOverlay: document.getElementById('resultCardOverlay'),
+  overlayClose: document.getElementById('overlayClose'),
+  overlayImage: document.getElementById('overlayImage'),
+  overlayMeta: document.getElementById('overlayMeta')
 };
 
 const state = {
   mode: 'human',
+  panelMode: 'run',
   drawing: {
     isDrawing: false,
     currentTool: 'pencil',
@@ -56,11 +72,19 @@ const state = {
     startY: 0
   },
   aiRun: null,
-  replay: {
+  lastRunLog: null,
+  pendingRunOverrides: null,
+  insideEvalMatrix: false,
+  evalRunner: {
     active: false,
-    timers: []
-  },
-  lastRunLog: null
+    stopRequested: false,
+    queue: [],
+    results: [],
+    startedAt: null,
+    config: null,
+    runByRunId: new Map(),
+    current: null
+  }
 };
 
 canvas.width = CANVAS_WIDTH;
@@ -72,169 +96,116 @@ ctx.lineWidth = state.drawing.lineWidth;
 ctx.lineCap = 'round';
 
 bindUiEvents();
-updateModeUi();
+updatePanelModeUi();
 updateRunTimer('--');
-updateTemperatureLabel(DEFAULT_TEMPERATURE);
 setAiStatus('idle');
 setAutosaveStatus('Autosave: waiting for next run.');
+if (ui.evalPrompts && !ui.evalPrompts.value.trim()) {
+  ui.evalPrompts.value = ui.aiPrompt.value.trim();
+}
+setEvalStatus('idle.');
+updateEvalUi();
 
 function bindUiEvents() {
-  ui.toolButtons.forEach((button) => {
-    button.addEventListener('click', () => {
-      if (state.mode !== 'human') return;
-      setTool(button.id);
+  if (ui.tabRunMode) {
+    ui.tabRunMode.addEventListener('click', () => setPanelMode('run'));
+  }
+  if (ui.tabEvalMode) {
+    ui.tabEvalMode.addEventListener('click', () => setPanelMode('eval'));
+  }
+
+  // Model dropdown: show/hide custom input
+  if (ui.modelSelect) {
+    ui.modelSelect.addEventListener('change', () => {
+      if (ui.modelCustom) {
+        ui.modelCustom.style.display = ui.modelSelect.value === '__custom__' ? '' : 'none';
+      }
     });
-  });
-
-  ui.colorPicker.addEventListener('input', (event) => {
-    if (state.mode !== 'human') return;
-    setColor(event.target.value);
-  });
-
-  ui.lineWidth.addEventListener('input', (event) => {
-    if (state.mode !== 'human') return;
-    setLineWidth(Number(event.target.value));
-  });
-
-  ui.temperatureInput.addEventListener('input', (event) => {
-    const temperature = clamp(
-      Number(event.target.value),
-      MIN_TEMPERATURE,
-      MAX_TEMPERATURE
-    );
-    updateTemperatureLabel(temperature);
-  });
-
-  ui.clearButton.addEventListener('click', () => {
-    if (state.mode !== 'human') return;
-    clearCanvas({ source: 'human' });
-  });
-
-  ui.saveButton.addEventListener('click', saveCanvasPng);
-
-  canvas.addEventListener('mousedown', startDrawing);
-  canvas.addEventListener('mousemove', draw);
-  canvas.addEventListener('mouseup', stopDrawing);
-  canvas.addEventListener('mouseleave', stopDrawing);
-
-  canvas.addEventListener('touchstart', (event) => {
-    event.preventDefault();
-    startDrawing(event.touches[0]);
-  }, { passive: false });
-
-  canvas.addEventListener('touchmove', (event) => {
-    event.preventDefault();
-    draw(event.touches[0]);
-  }, { passive: false });
-
-  canvas.addEventListener('touchend', (event) => {
-    event.preventDefault();
-    stopDrawing();
-  }, { passive: false });
+  }
 
   ui.startAiButton.addEventListener('click', startAiRun);
   ui.stopAiButton.addEventListener('click', () => {
     if (state.aiRun?.active) {
       stopAiRun('Stopped by user.', { manual: true });
-      return;
-    }
-
-    if (state.replay.active) {
-      stopReplay('Replay stopped by user.');
     }
   });
 
   ui.downloadLog.addEventListener('click', downloadLastRunLog);
-  ui.replayRun.addEventListener('click', replayLastRun);
-}
+  ui.startEvalMatrix.addEventListener('click', startEvalMatrix);
+  ui.stopEvalMatrix.addEventListener('click', stopEvalMatrix);
+  ui.downloadEvalCsv.addEventListener('click', downloadEvalCsv);
 
-function getPositionFromEvent(event) {
-  const rect = canvas.getBoundingClientRect();
-  return {
-    x: clamp(Math.round(event.clientX - rect.left), 0, CANVAS_WIDTH),
-    y: clamp(Math.round(event.clientY - rect.top), 0, CANVAS_HEIGHT)
-  };
-}
-
-function startDrawing(event) {
-  if (state.mode !== 'human' || state.replay.active) return;
-  const { x, y } = getPositionFromEvent(event);
-  state.drawing.isDrawing = true;
-  state.drawing.startX = x;
-  state.drawing.startY = y;
-
-  if (state.drawing.currentTool === 'fill') {
-    executeDrawAction({
-      tool: 'fill',
-      color: state.drawing.color,
-      lineWidth: state.drawing.lineWidth,
-      startX: x,
-      startY: y,
-      x,
-      y
-    }, { source: 'human' });
-    state.drawing.isDrawing = false;
-    return;
+  // Gallery overlay close
+  if (ui.overlayClose) {
+    ui.overlayClose.addEventListener('click', closeResultOverlay);
   }
-
-  if (state.drawing.currentTool === 'pencil' || state.drawing.currentTool === 'brush' || state.drawing.currentTool === 'eraser') {
-    ctx.beginPath();
-    ctx.moveTo(x, y);
+  if (ui.resultCardOverlay) {
+    ui.resultCardOverlay.addEventListener('click', (e) => {
+      if (e.target === ui.resultCardOverlay) closeResultOverlay();
+    });
   }
 }
 
-function draw(event) {
-  if (!state.drawing.isDrawing || state.mode !== 'human' || state.replay.active) return;
+function getSelectedModel() {
+  if (!ui.modelSelect) return DEFAULT_MODEL;
+  if (ui.modelSelect.value === '__custom__') {
+    return String(ui.modelCustom?.value || '').trim() || DEFAULT_MODEL;
+  }
+  return ui.modelSelect.value || DEFAULT_MODEL;
+}
 
-  const { x, y } = getPositionFromEvent(event);
-  const action = {
-    tool: state.drawing.currentTool,
-    color: state.drawing.color,
-    lineWidth: state.drawing.lineWidth,
-    startX: state.drawing.startX,
-    startY: state.drawing.startY,
-    x,
-    y
-  };
-
-  if (state.drawing.currentTool === 'fill') return;
-  executeDrawAction(action, { source: 'human' });
-
-  if (state.drawing.currentTool !== 'spray') {
-    state.drawing.startX = x;
-    state.drawing.startY = y;
+function setModelUi(model) {
+  if (!ui.modelSelect) return;
+  const isPreset = AVAILABLE_MODELS.includes(model);
+  if (isPreset) {
+    ui.modelSelect.value = model;
+    if (ui.modelCustom) ui.modelCustom.style.display = 'none';
+  } else {
+    ui.modelSelect.value = '__custom__';
+    if (ui.modelCustom) {
+      ui.modelCustom.value = model;
+      ui.modelCustom.style.display = '';
+    }
   }
 }
 
-function stopDrawing() {
-  state.drawing.isDrawing = false;
+function setPanelMode(mode) {
+  const normalized = mode === 'eval' ? 'eval' : 'run';
+  if (state.panelMode === normalized) return;
+  state.panelMode = normalized;
+  updatePanelModeUi();
+}
+
+function updatePanelModeUi() {
+  for (const tab of ui.panelModeTabs) {
+    const mode = tab.getAttribute('data-panel-tab');
+    const active = mode === state.panelMode;
+    tab.classList.toggle('is-active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+  }
+
+  for (const section of ui.panelModeSections) {
+    const sectionMode = section.getAttribute('data-panel-mode');
+    const show = sectionMode === state.panelMode;
+    section.classList.toggle('is-hidden', !show);
+  }
 }
 
 function setTool(tool) {
   if (!VALID_TOOLS.includes(tool)) return;
   state.drawing.currentTool = tool;
-  ui.toolButtons.forEach((button) => button.classList.toggle('active', button.id === tool));
 }
 
 function setColor(color) {
   const normalized = normalizeColor(color);
   state.drawing.color = normalized;
-  ui.colorPicker.value = normalized;
   ctx.strokeStyle = normalized;
 }
 
 function setLineWidth(width) {
   const normalized = clamp(Math.round(Number(width) || state.drawing.lineWidth), 1, 50);
   state.drawing.lineWidth = normalized;
-  ui.lineWidth.value = String(normalized);
   ctx.lineWidth = normalized;
-}
-
-function saveCanvasPng() {
-  const link = document.createElement('a');
-  link.download = `ai-painter-${Date.now()}.png`;
-  link.href = canvas.toDataURL('image/png');
-  link.click();
 }
 
 function pushUndoSnapshot(run) {
@@ -350,10 +321,6 @@ function executeDrawAction(rawAction, options = {}) {
     appendRunAction('draw_action', action);
     appendRunEvent('tool_effect', { kind: 'draw_action', action });
     state.aiRun.lastVisualChangeAtMs = Date.now() - state.aiRun.startedAt;
-  }
-
-  if (source === 'replay' && !skipLog) {
-    appendRunEvent('replay_effect', { kind: 'draw_action', action });
   }
 
   return action;
@@ -493,24 +460,43 @@ function colorsMatchWithTolerance(r1, g1, b1, a1, r2, g2, b2, a2, tolerance) {
 }
 
 async function startAiRun() {
-  if (state.aiRun?.active || state.replay.active) return;
+  if (state.aiRun?.active) return;
+  if (!state.insideEvalMatrix) {
+    setPanelMode('run');
+  }
 
-  const prompt = ui.aiPrompt.value.trim();
+  const overrides = state.pendingRunOverrides && typeof state.pendingRunOverrides === 'object'
+    ? state.pendingRunOverrides
+    : null;
+  state.pendingRunOverrides = null;
+
+  const promptSource = overrides?.prompt ?? ui.aiPrompt.value;
+  const prompt = String(promptSource || '').trim();
   if (!prompt) {
     setAiStatus('enter a prompt before starting.');
     return;
   }
 
-  const model = (ui.modelInput.value || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-  const temperature = normalizeTemperature(ui.temperatureInput.value);
-  ui.temperatureInput.value = temperature.toFixed(1);
-  updateTemperatureLabel(temperature);
+  const modelSource = overrides?.model ?? getSelectedModel();
+  const model = String(modelSource || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
   const maxRunSeconds = clamp(
-    Math.round(Number(ui.maxRunSeconds.value) || DEFAULT_MAX_RUN_SECONDS),
+    Math.round(Number(overrides?.maxRunSeconds ?? ui.maxRunSeconds.value) || DEFAULT_MAX_RUN_SECONDS),
     MIN_MAX_RUN_SECONDS,
     MAX_MAX_RUN_SECONDS
   );
+  const allowClearTool = typeof overrides?.allowClearTool === 'boolean'
+    ? overrides.allowClearTool
+    : ui.allowClearTool.checked;
+  const gridForScreenshots = typeof overrides?.gridForScreenshots === 'boolean'
+    ? overrides.gridForScreenshots
+    : ui.gridForScreenshots.checked;
+  const evalMeta = sanitizeEvalMeta(overrides?.evalMeta);
+
+  ui.aiPrompt.value = prompt;
+  setModelUi(model);
   ui.maxRunSeconds.value = String(maxRunSeconds);
+  ui.allowClearTool.checked = allowClearTool;
+  ui.gridForScreenshots.checked = gridForScreenshots;
 
   const runId = createRunId();
   const startedAt = Date.now();
@@ -521,7 +507,9 @@ async function startAiRun() {
     stopping: false,
     prompt,
     model,
-    temperature,
+    allowClearTool,
+    gridForScreenshots,
+    evalMeta,
     startedAt,
     maxRunSeconds,
     deadline: startedAt + (maxRunSeconds * 1000),
@@ -545,17 +533,25 @@ async function startAiRun() {
     lastSocketCloseDetail: null,
     screenshotCount: 0,
     screenshotArtifacts: [],
+    reflectionCount: 0,
     lastVisualChangeAtMs: -1,
     lastScreenshotAtMs: -1,
+    lastReflectAtMs: -1,
+    lastReflectWantsMoreWork: false,
+    pendingReflectAfterScreenshot: false,
     transcript: '',
     log: {
       version: 1,
       runId,
       prompt,
       model,
-      temperature,
       startedAt: new Date(startedAt).toISOString(),
       maxRunSeconds,
+      settings: {
+        allowClearTool,
+        gridForScreenshots,
+        eval: evalMeta
+      },
       events: [],
       actions: [],
       finalReason: null,
@@ -574,15 +570,16 @@ async function startAiRun() {
   ui.stopAiButton.disabled = false;
   ui.stopAiButton.textContent = 'Stop';
   ui.downloadLog.disabled = true;
-  ui.replayRun.disabled = true;
   ui.assistantText.textContent = '';
   setAutosaveStatus(`Autosave: pending for run ${runId}.`);
 
   appendRunEvent('run_started', {
     prompt,
     model,
-    temperature,
-    maxRunSeconds
+    maxRunSeconds,
+    allowClearTool,
+    gridForScreenshots,
+    eval: evalMeta
   });
 
   setAiStatus('connecting to local responses websocket proxy...');
@@ -968,6 +965,60 @@ async function processToolCall(run, call) {
       return;
     }
 
+    if (call.name === 'finish' && run.pendingReflectAfterScreenshot) {
+      const blockedOutput = {
+        ok: false,
+        blocked: true,
+        reason: 'finish_requires_reflect_after_screenshot',
+        message: 'Call reflect after reviewing your latest screenshot, then call finish.'
+      };
+
+      enqueueInputItems(run, [
+        {
+          type: 'function_call_output',
+          call_id: call.callId,
+          output: JSON.stringify(blockedOutput)
+        }
+      ]);
+
+      appendRunEvent('tool_result', {
+        callId: call.callId,
+        name: call.name,
+        result: sanitizeForLog(blockedOutput),
+        attachedImage: false
+      });
+
+      setAiStatus('finish blocked: reflection required after screenshot.');
+      return;
+    }
+
+    if (call.name === 'finish' && run.lastReflectWantsMoreWork) {
+      const blockedOutput = {
+        ok: false,
+        blocked: true,
+        reason: 'finish_blocked_low_confidence',
+        message: 'Your last reflection had confidence below 90% and listed next actions. Execute those improvements, then take_screenshot and reflect again.'
+      };
+
+      enqueueInputItems(run, [
+        {
+          type: 'function_call_output',
+          call_id: call.callId,
+          output: JSON.stringify(blockedOutput)
+        }
+      ]);
+
+      appendRunEvent('tool_result', {
+        callId: call.callId,
+        name: call.name,
+        result: sanitizeForLog(blockedOutput),
+        attachedImage: false
+      });
+
+      setAiStatus('finish blocked: low confidence — more work needed.');
+      return;
+    }
+
     const result = await executeAgentTool(call.name, args);
 
     const inputItems = [
@@ -982,6 +1033,7 @@ async function processToolCall(run, call) {
       run.screenshotCount += 1;
       if (call.name === 'take_screenshot') {
         run.lastScreenshotAtMs = Date.now() - run.startedAt;
+        run.pendingReflectAfterScreenshot = true;
         run.screenshotArtifacts.push({
           atMs: run.lastScreenshotAtMs,
           includeGrid: Boolean(result.output?.includeGrid),
@@ -990,18 +1042,29 @@ async function processToolCall(run, call) {
           imageDataUrl: result.imageDataUrl
         });
       }
+
+      const screenshotContent = [
+        {
+          type: 'input_text',
+          text: result.imageNote || 'Requested canvas screenshot attached.'
+        }
+      ];
+
+      if (call.name === 'take_screenshot') {
+        screenshotContent.push({
+          type: 'input_text',
+          text: 'Now call reflect with a short critique: what works, one issue to fix, and your next concrete edits.'
+        });
+      }
+
+      screenshotContent.push({
+        type: 'input_image',
+        image_url: result.imageDataUrl
+      });
+
       inputItems.push({
         role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: result.imageNote || 'Requested canvas screenshot attached.'
-          },
-          {
-            type: 'input_image',
-            image_url: result.imageDataUrl
-          }
-        ]
+        content: screenshotContent
       });
     }
 
@@ -1160,7 +1223,6 @@ function maybeSendQueuedResponseCreate(run) {
 
   const responsePayload = {
     model: run.model,
-    temperature: run.temperature,
     store: false,
     tools: getRealtimeTools(),
     tool_choice: 'auto'
@@ -1221,56 +1283,246 @@ function parseRetryAfterSeconds(message) {
   return Number.isFinite(value) ? value : null;
 }
 
+function normalizedToCanvasCoordinate(rawValue, maxValue) {
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) return 0;
+  if (numeric >= 0 && numeric <= 1) {
+    return clamp(Math.round(numeric * maxValue), 0, maxValue);
+  }
+  return clamp(Math.round(numeric), 0, maxValue);
+}
+
+function normalizedToCanvasX(rawValue) {
+  return normalizedToCanvasCoordinate(rawValue, CANVAS_WIDTH);
+}
+
+function normalizedToCanvasY(rawValue) {
+  return normalizedToCanvasCoordinate(rawValue, CANVAS_HEIGHT);
+}
+
 async function executeAgentTool(name, args) {
+  const safeArgs = args && typeof args === 'object' ? args : {};
+
   switch (name) {
+    case 'stroke_line': {
+      const tool = ['pencil', 'brush', 'eraser'].includes(safeArgs.tool) ? safeArgs.tool : null;
+      if (!tool) {
+        return {
+          output: {
+            ok: false,
+            error: 'Invalid stroke_line tool. Use pencil, brush, or eraser.'
+          }
+        };
+      }
+
+      pushUndoSnapshot(state.aiRun);
+      const action = executeDrawAction({
+        tool,
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: safeArgs.lineWidth || state.drawing.lineWidth,
+        startX: normalizedToCanvasX(safeArgs.startX),
+        startY: normalizedToCanvasY(safeArgs.startY),
+        x: normalizedToCanvasX(safeArgs.endX),
+        y: normalizedToCanvasY(safeArgs.endY)
+      }, { source: 'ai' });
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
+    case 'stroke_polyline': {
+      const points = safeArgs.points;
+      if (!Array.isArray(points) || points.length < 2) {
+        return {
+          output: {
+            ok: false,
+            error: 'stroke_polyline requires an array of at least 2 points.'
+          }
+        };
+      }
+
+      const tool = ['pencil', 'brush', 'eraser'].includes(safeArgs.tool) ? safeArgs.tool : 'pencil';
+      const color = safeArgs.color || state.drawing.color;
+      const lineWidth = clamp(Math.round(Number(safeArgs.lineWidth) || state.drawing.lineWidth), 1, 50);
+      const normalizedColor = normalizeColor(color);
+
+      pushUndoSnapshot(state.aiRun);
+
+      const pixelPoints = points.map(p => ({
+        x: normalizedToCanvasX(p.x),
+        y: normalizedToCanvasY(p.y)
+      }));
+
+      ctx.beginPath();
+      ctx.strokeStyle = tool === 'eraser' ? '#FFFFFF' : normalizedColor;
+      ctx.lineWidth = lineWidth;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.moveTo(pixelPoints[0].x, pixelPoints[0].y);
+      for (let i = 1; i < pixelPoints.length; i++) {
+        ctx.lineTo(pixelPoints[i].x, pixelPoints[i].y);
+      }
+      ctx.stroke();
+
+      const action = { tool, color: normalizedColor, lineWidth, points: pixelPoints, pointCount: pixelPoints.length };
+
+      if (state.aiRun?.active) {
+        appendRunAction('stroke_polyline', action);
+        appendRunEvent('tool_effect', { kind: 'stroke_polyline', action });
+        state.aiRun.lastVisualChangeAtMs = Date.now() - state.aiRun.startedAt;
+      }
+
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
+    case 'stroke_rectangle': {
+      pushUndoSnapshot(state.aiRun);
+      const action = executeDrawAction({
+        tool: 'rectangle',
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: safeArgs.lineWidth || state.drawing.lineWidth,
+        startX: normalizedToCanvasX(safeArgs.x1),
+        startY: normalizedToCanvasY(safeArgs.y1),
+        x: normalizedToCanvasX(safeArgs.x2),
+        y: normalizedToCanvasY(safeArgs.y2)
+      }, { source: 'ai' });
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
+    case 'stroke_circle': {
+      pushUndoSnapshot(state.aiRun);
+      const action = executeDrawAction({
+        tool: 'circle',
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: safeArgs.lineWidth || state.drawing.lineWidth,
+        startX: normalizedToCanvasX(safeArgs.centerX),
+        startY: normalizedToCanvasY(safeArgs.centerY),
+        x: normalizedToCanvasX(safeArgs.edgeX),
+        y: normalizedToCanvasY(safeArgs.edgeY)
+      }, { source: 'ai' });
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
+    case 'spray_cluster': {
+      pushUndoSnapshot(state.aiRun);
+      const pointX = normalizedToCanvasX(safeArgs.x);
+      const pointY = normalizedToCanvasY(safeArgs.y);
+      const action = executeDrawAction({
+        tool: 'spray',
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: safeArgs.lineWidth || state.drawing.lineWidth,
+        startX: pointX,
+        startY: pointY,
+        x: pointX,
+        y: pointY,
+        seed: safeArgs.seed
+      }, { source: 'ai' });
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
+    case 'flood_fill': {
+      pushUndoSnapshot(state.aiRun);
+      const pointX = normalizedToCanvasX(safeArgs.x);
+      const pointY = normalizedToCanvasY(safeArgs.y);
+      const action = executeDrawAction({
+        tool: 'fill',
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: 1,
+        startX: pointX,
+        startY: pointY,
+        x: pointX,
+        y: pointY
+      }, { source: 'ai' });
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
+    }
+
     case 'set_tool': {
-      const tool = VALID_TOOLS.includes(args.tool) ? args.tool : null;
+      const tool = VALID_TOOLS.includes(safeArgs.tool) ? safeArgs.tool : null;
       if (!tool) return { output: { ok: false, error: 'Invalid tool.' } };
       setTool(tool);
       return { output: { ok: true } };
     }
 
     case 'set_color': {
-      const color = normalizeColor(args.color);
+      const color = normalizeColor(safeArgs.color);
       setColor(color);
       return { output: { ok: true } };
     }
 
     case 'set_line_width': {
-      const width = clamp(Math.round(Number(args.lineWidth) || 1), 1, 50);
+      const width = clamp(Math.round(Number(safeArgs.lineWidth) || 1), 1, 50);
       setLineWidth(width);
       return { output: { ok: true } };
     }
 
     case 'draw_action': {
       pushUndoSnapshot(state.aiRun);
-      executeDrawAction({
-        tool: args.tool || state.drawing.currentTool,
-        color: args.color || state.drawing.color,
-        lineWidth: args.lineWidth || state.drawing.lineWidth,
-        startX: args.startX,
-        startY: args.startY,
-        x: args.x,
-        y: args.y,
-        seed: args.seed
+      const action = executeDrawAction({
+        tool: safeArgs.tool || state.drawing.currentTool,
+        color: safeArgs.color || state.drawing.color,
+        lineWidth: safeArgs.lineWidth || state.drawing.lineWidth,
+        startX: normalizedToCanvasX(safeArgs.startX),
+        startY: normalizedToCanvasY(safeArgs.startY),
+        x: normalizedToCanvasX(safeArgs.x),
+        y: normalizedToCanvasY(safeArgs.y),
+        seed: safeArgs.seed
       }, { source: 'ai' });
-      return { output: { ok: true } };
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
     }
 
     case 'fill_rectangle': {
       pushUndoSnapshot(state.aiRun);
-      fillRectangleAction({
-        color: args.color || state.drawing.color,
-        x1: args.x1,
-        y1: args.y1,
-        x2: args.x2,
-        y2: args.y2
+      const action = fillRectangleAction({
+        color: safeArgs.color || state.drawing.color,
+        x1: normalizedToCanvasX(safeArgs.x1),
+        y1: normalizedToCanvasY(safeArgs.y1),
+        x2: normalizedToCanvasX(safeArgs.x2),
+        y2: normalizedToCanvasY(safeArgs.y2)
       }, { source: 'ai' });
-      return { output: { ok: true } };
+      return {
+        output: {
+          ok: true,
+          action
+        }
+      };
     }
 
     case 'clear_canvas': {
-      if (!ui.allowClearTool.checked) {
+      const clearAllowed = state.aiRun ? state.aiRun.allowClearTool : ui.allowClearTool.checked;
+      if (!clearAllowed) {
         return {
           output: {
             ok: false,
@@ -1286,9 +1538,9 @@ async function executeAgentTool(name, args) {
     }
 
     case 'take_screenshot': {
-      const includeGrid = typeof args.includeGrid === 'boolean'
-        ? args.includeGrid
-        : ui.gridForScreenshots.checked;
+      const includeGrid = typeof safeArgs.includeGrid === 'boolean'
+        ? safeArgs.includeGrid
+        : (state.aiRun ? state.aiRun.gridForScreenshots : ui.gridForScreenshots.checked);
       const imageDataUrl = captureCanvasDataUrl(includeGrid, {
         maxSide: SCREENSHOT_MAX_SIDE,
         outputType: SCREENSHOT_OUTPUT_TYPE,
@@ -1313,6 +1565,67 @@ async function executeAgentTool(name, args) {
         imageNote: includeGrid
           ? `Screenshot attached with coordinate grid overlay (${dimensions.width}x${dimensions.height}).`
           : `Screenshot attached (${dimensions.width}x${dimensions.height}).`
+      };
+    }
+
+    case 'reflect': {
+      const allowedPhases = ['explore', 'block_in', 'structure', 'refine', 'final_review'];
+      const phase = allowedPhases.includes(String(safeArgs.phase))
+        ? String(safeArgs.phase)
+        : 'refine';
+      const whatWorks = String(safeArgs.whatWorks || '').trim().slice(0, 280);
+      const issueToFix = String(safeArgs.issueToFix || '').trim().slice(0, 280);
+      const nextActions = Array.isArray(safeArgs.nextActions)
+        ? safeArgs.nextActions
+          .map((entry) => String(entry || '').trim().slice(0, 180))
+          .filter(Boolean)
+          .slice(0, 6)
+        : [];
+      const rawConfidence = Number(safeArgs.confidence);
+      const confidence = Number.isFinite(rawConfidence) ? clamp(rawConfidence, 0, 1) : null;
+
+      const reflection = {
+        phase,
+        whatWorks,
+        issueToFix,
+        nextActions,
+        confidence
+      };
+
+      if (!whatWorks || !issueToFix || nextActions.length === 0) {
+        return {
+          output: {
+            ok: false,
+            error: 'reflect requires non-empty whatWorks, issueToFix, and nextActions.'
+          }
+        };
+      }
+
+      if (state.aiRun) {
+        state.aiRun.lastReflectAtMs = Date.now() - state.aiRun.startedAt;
+        state.aiRun.pendingReflectAfterScreenshot = false;
+        state.aiRun.reflectionCount += 1;
+        appendRunAction('reflect', reflection);
+        appendRunEvent('tool_effect', { kind: 'reflect', reflection });
+      }
+
+      const lowConfidence = confidence !== null && confidence < 0.9;
+      const hasNextActions = nextActions.length > 0;
+      const shouldContinue = lowConfidence && hasNextActions;
+
+      if (state.aiRun) {
+        state.aiRun.lastReflectWantsMoreWork = shouldContinue;
+      }
+
+      return {
+        output: {
+          ok: true,
+          reflectionCount: state.aiRun ? state.aiRun.reflectionCount : null,
+          shouldContinue,
+          message: shouldContinue
+            ? `Confidence ${(confidence * 100).toFixed(0)}% is below 90%. Execute your nextActions before finishing.`
+            : 'Reflection recorded. You may finish if satisfied.'
+        }
       };
     }
 
@@ -1355,7 +1668,7 @@ async function executeAgentTool(name, args) {
       return {
         output: {
           ok: true,
-          summary: String(args.summary || '')
+          summary: String(safeArgs.summary || '')
         }
       };
     }
@@ -1373,9 +1686,7 @@ async function executeAgentTool(name, args) {
 function stopAiRun(reason, options = {}) {
   const run = state.aiRun;
   if (!run || !run.active) {
-    if (!state.replay.active) {
-      setControlMode('human');
-    }
+    setControlMode('human');
     return;
   }
 
@@ -1413,6 +1724,19 @@ function stopAiRun(reason, options = {}) {
   };
 
   state.lastRunLog = run.log;
+
+  // Capture result card for gallery (single runs and eval runs)
+  const capturedImageDataUrl = captureCanvasDataUrl(false, {
+    maxSide: Math.max(CANVAS_WIDTH, CANVAS_HEIGHT),
+    outputType: 'image/png',
+    quality: 0.92
+  });
+  const resultForCard = summarizeEvalRun(
+    { prompt: run.prompt, model: run.model, maxRunSeconds: run.maxRunSeconds, gridForScreenshots: run.gridForScreenshots, allowClearTool: run.allowClearTool, comboIndex: 0, repeat: 1 },
+    run.log
+  );
+  addResultCard(resultForCard, capturedImageDataUrl);
+
   state.aiRun = null;
 
   updateRunTimer('--');
@@ -1424,11 +1748,8 @@ function stopAiRun(reason, options = {}) {
 
   const hasActions = Array.isArray(state.lastRunLog.actions) && state.lastRunLog.actions.length > 0;
   ui.downloadLog.disabled = !hasActions;
-  ui.replayRun.disabled = !hasActions;
 
-  if (!state.replay.active) {
-    setControlMode('human');
-  }
+  setControlMode('human');
 
   const runId = run.id;
   const logRef = state.lastRunLog;
@@ -1528,107 +1849,67 @@ function buildRealtimeInstructions(prompt) {
   return [
     `You are a painter. Your commission: "${prompt}".`,
     '',
-    'CANVAS COORDINATES:',
-    `  Canvas is ${CANVAS_WIDTH}x${CANVAS_HEIGHT} pixels. Origin (0,0) is top-left.`,
-    `  X increases rightward (0–${CANVAS_WIDTH}). Y increases downward (0–${CANVAS_HEIGHT}).`,
-    `  Center: (${CANVAS_WIDTH / 2}, ${CANVAS_HEIGHT / 2}). Top-third: y < ${Math.round(CANVAS_HEIGHT / 3)}. Bottom-third: y > ${Math.round(CANVAS_HEIGHT * 2 / 3)}.`,
+    'COORDINATE SYSTEM:',
+    `  Runtime canvas is ${CANVAS_WIDTH}x${CANVAS_HEIGHT} pixels.`,
+    '  All tool coordinates MUST be normalized in [0.0, 1.0].',
+    '  (0,0) is top-left. (1,1) is bottom-right. (0.5,0.5) is center.',
     '',
-    'PAINTING PROCESS:',
-    '  1. Start with background — use fill_rectangle to block in large color areas (sky, ground, water).',
-    '  2. Add mid-ground shapes and forms with brush or spray.',
-    '  3. Layer foreground elements and details last.',
-    '  4. Take a screenshot periodically to check your work. Fix issues with undo or paint over.',
-    '  5. After your final changes, take_screenshot, review, then call finish.',
+    'PAINTING WORKFLOW:',
+    '  1. Start with background blocks using fill_rectangle.',
+    '  2. Build major forms with stroke_line, stroke_polyline, stroke_rectangle, stroke_circle.',
+    '  3. Add atmosphere and texture with spray_cluster and flood_fill.',
+    '  4. Take screenshots regularly, then call reflect to critique and plan next edits.',
+    '  5. If reflect shows confidence below 90%, you MUST execute your nextActions, then screenshot + reflect again.',
+    '  6. Repeat the paint→screenshot→reflect loop until confidence reaches 90%+, then call finish.',
     '',
-    'TOOL TECHNIQUES:',
-    '  fill_rectangle — ideal for blocking in backgrounds, sky bands, ground planes, and large flat areas.',
-    '  brush/pencil — draw lines and strokes. startX,startY is the stroke start; x,y is the stroke end.',
-    '  spray — soft gradients and texture. Creates a dot cluster around (x,y). Great for clouds, fog, atmosphere.',
-    '  circle — outline circle centered at (startX,startY) with radius = distance to (x,y).',
-    '  rectangle — outline rect from (startX,startY) to (x,y).',
-    '  fill — flood fill from (startX,startY). Fills connected same-color region.',
-    '  eraser — white stroke from (startX,startY) to (x,y).',
-    '  undo — revert the last drawing operation if something looks wrong.',
-    '  undo_to_screenshot — roll back everything to how the canvas looked at your last screenshot.',
+    'TOOLS:',
+    '  fill_rectangle(color,x1,y1,x2,y2) -> solid rectangle fill.',
+    '  stroke_line(tool,color,lineWidth,startX,startY,endX,endY) -> tool: pencil, brush, eraser.',
+    '  stroke_polyline(color,lineWidth,points[{x,y}],tool?) -> connected path through 2-64 normalized points. Use for curves and organic shapes.',
+    '  stroke_rectangle(color,lineWidth,x1,y1,x2,y2) -> outlined rectangle.',
+    '  stroke_circle(color,lineWidth,centerX,centerY,edgeX,edgeY) -> outlined circle.',
+    '  spray_cluster(color,lineWidth,x,y,seed?) -> clustered spray texture.',
+    '  flood_fill(color,x,y) -> flood fill from point.',
+    '  reflect(phase,whatWorks,issueToFix,nextActions,confidence?) -> short planning/critique checkpoint.',
+    '  undo -> revert last operation.',
+    '  undo_to_screenshot -> revert to last screenshot checkpoint.',
     '',
-    'CREATIVE PHILOSOPHY:',
-    '  Be bold — large confident shapes read better than tiny precise ones.',
+    'STYLE GUIDANCE:',
+    '  Be bold: large confident shapes read better than tiny precise ones.',
     '  Trust your instincts. Imperfection is expressive.',
     '  Layer colors: paint over earlier layers to build depth and richness.',
-    '  Use color temperature — warm foregrounds, cool backgrounds for depth.',
+    '  Use color temperature: warm foregrounds, cool backgrounds for depth.',
     '',
     'TECHNICAL REQUIREMENTS:',
-    '  Use tool calls only — no text responses.',
-    '  Prefer draw_action with explicit tool/color/lineWidth over separate set_* calls.',
-    '  Batch multiple draw actions per response when possible.',
-    '  Take a screenshot every 15–25 drawing actions to verify composition.',
-    '  clear_canvas is destructive — erases everything. It may be blocked.',
+    '  Use tool calls only. Do not return plain text answers.',
+    '  Keep coordinates normalized in [0,1].',
+    '  Batch multiple tool calls per response when useful.',
+    '  Take a screenshot every 12-20 drawing operations.',
+    '  After each screenshot, call reflect. If confidence < 90%, execute your nextActions before finishing.',
+    '  clear_canvas is destructive and may be blocked.',
     '  When complete, call finish with a concise summary of what you painted.'
   ].join('\n');
 }
 
 function getRealtimeTools() {
+  const normalizedCoord = {
+    type: 'number',
+    minimum: 0,
+    maximum: 1
+  };
+
   return [
     {
       type: 'function',
-      name: 'set_tool',
-      description: 'Set the current tool.',
+      name: 'stroke_line',
+      description: 'Draw one line segment using pencil, brush, or eraser with normalized coordinates.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
           tool: {
             type: 'string',
-            enum: VALID_TOOLS
-          }
-        },
-        required: ['tool']
-      }
-    },
-    {
-      type: 'function',
-      name: 'set_color',
-      description: 'Set active color.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          color: {
-            type: 'string',
-            pattern: '^#[0-9A-Fa-f]{6}$'
-          }
-        },
-        required: ['color']
-      }
-    },
-    {
-      type: 'function',
-      name: 'set_line_width',
-      description: 'Set line width.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          lineWidth: {
-            type: 'integer',
-            minimum: 1,
-            maximum: 50
-          }
-        },
-        required: ['lineWidth']
-      }
-    },
-    {
-      type: 'function',
-      name: 'draw_action',
-      description: 'Draw one stroke or shape. See instructions for tool-specific coordinate meanings.',
-      parameters: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          tool: {
-            type: 'string',
-            enum: VALID_TOOLS
+            enum: ['pencil', 'brush', 'eraser']
           },
           color: {
             type: 'string',
@@ -1639,39 +1920,136 @@ function getRealtimeTools() {
             minimum: 1,
             maximum: 50
           },
-          startX: {
-            type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_WIDTH
+          startX: normalizedCoord,
+          startY: normalizedCoord,
+          endX: normalizedCoord,
+          endY: normalizedCoord
+        },
+        required: ['tool', 'color', 'lineWidth', 'startX', 'startY', 'endX', 'endY']
+      }
+    },
+    {
+      type: 'function',
+      name: 'stroke_polyline',
+      description: 'Draw a connected path through multiple normalized points. Great for curves, organic shapes, and flowing lines.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          color: {
+            type: 'string',
+            pattern: '^#[0-9A-Fa-f]{6}$'
           },
-          startY: {
+          lineWidth: {
             type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_HEIGHT
+            minimum: 1,
+            maximum: 50
           },
-          x: {
+          points: {
+            type: 'array',
+            minItems: 2,
+            maxItems: 64,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                x: { type: 'number', minimum: 0, maximum: 1 },
+                y: { type: 'number', minimum: 0, maximum: 1 }
+              },
+              required: ['x', 'y']
+            }
+          },
+          tool: {
+            type: 'string',
+            enum: ['pencil', 'brush', 'eraser'],
+            default: 'pencil'
+          }
+        },
+        required: ['color', 'lineWidth', 'points']
+      }
+    },
+    {
+      type: 'function',
+      name: 'stroke_rectangle',
+      description: 'Draw an outlined rectangle between two normalized corner points.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          color: {
+            type: 'string',
+            pattern: '^#[0-9A-Fa-f]{6}$'
+          },
+          lineWidth: {
             type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_WIDTH
+            minimum: 1,
+            maximum: 50
           },
-          y: {
+          x1: normalizedCoord,
+          y1: normalizedCoord,
+          x2: normalizedCoord,
+          y2: normalizedCoord
+        },
+        required: ['color', 'lineWidth', 'x1', 'y1', 'x2', 'y2']
+      }
+    },
+    {
+      type: 'function',
+      name: 'stroke_circle',
+      description: 'Draw an outlined circle from normalized center and edge points.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          color: {
+            type: 'string',
+            pattern: '^#[0-9A-Fa-f]{6}$'
+          },
+          lineWidth: {
             type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_HEIGHT
+            minimum: 1,
+            maximum: 50
           },
+          centerX: normalizedCoord,
+          centerY: normalizedCoord,
+          edgeX: normalizedCoord,
+          edgeY: normalizedCoord
+        },
+        required: ['color', 'lineWidth', 'centerX', 'centerY', 'edgeX', 'edgeY']
+      }
+    },
+    {
+      type: 'function',
+      name: 'spray_cluster',
+      description: 'Spray a textured cluster at a normalized point.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          color: {
+            type: 'string',
+            pattern: '^#[0-9A-Fa-f]{6}$'
+          },
+          lineWidth: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 50
+          },
+          x: normalizedCoord,
+          y: normalizedCoord,
           seed: {
             type: 'integer',
             minimum: 0,
             maximum: 4294967295
           }
         },
-        required: ['tool', 'color', 'lineWidth', 'startX', 'startY', 'x', 'y']
+        required: ['color', 'lineWidth', 'x', 'y']
       }
     },
     {
       type: 'function',
-      name: 'fill_rectangle',
-      description: 'Fill a rectangle with solid color. Corners at (x1,y1) and (x2,y2).',
+      name: 'flood_fill',
+      description: 'Flood fill a connected region from a normalized point.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -1680,26 +2058,28 @@ function getRealtimeTools() {
             type: 'string',
             pattern: '^#[0-9A-Fa-f]{6}$'
           },
-          x1: {
-            type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_WIDTH
+          x: normalizedCoord,
+          y: normalizedCoord
+        },
+        required: ['color', 'x', 'y']
+      }
+    },
+    {
+      type: 'function',
+      name: 'fill_rectangle',
+      description: 'Fill a rectangle with solid color between two normalized corners.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          color: {
+            type: 'string',
+            pattern: '^#[0-9A-Fa-f]{6}$'
           },
-          y1: {
-            type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_HEIGHT
-          },
-          x2: {
-            type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_WIDTH
-          },
-          y2: {
-            type: 'integer',
-            minimum: 0,
-            maximum: CANVAS_HEIGHT
-          }
+          x1: normalizedCoord,
+          y1: normalizedCoord,
+          x2: normalizedCoord,
+          y2: normalizedCoord
         },
         required: ['color', 'x1', 'y1', 'x2', 'y2']
       }
@@ -1730,6 +2110,44 @@ function getRealtimeTools() {
             type: 'boolean'
           }
         }
+      }
+    },
+    {
+      type: 'function',
+      name: 'reflect',
+      description: 'Record a brief critique and next-step plan after reviewing a screenshot.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          phase: {
+            type: 'string',
+            enum: ['explore', 'block_in', 'structure', 'refine', 'final_review']
+          },
+          whatWorks: {
+            type: 'string',
+            maxLength: 280
+          },
+          issueToFix: {
+            type: 'string',
+            maxLength: 280
+          },
+          nextActions: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 6,
+            items: {
+              type: 'string',
+              maxLength: 180
+            }
+          },
+          confidence: {
+            type: 'number',
+            minimum: 0,
+            maximum: 1
+          }
+        },
+        required: ['phase', 'whatWorks', 'issueToFix', 'nextActions']
       }
     },
     {
@@ -1917,104 +2335,6 @@ function sanitizeForLog(value) {
   return value;
 }
 
-let replayUndoStack = [];
-let replayLastScreenshotImageData = null;
-
-function replayLastRun() {
-  if (state.aiRun?.active || state.replay.active) return;
-  if (!state.lastRunLog || !Array.isArray(state.lastRunLog.actions) || state.lastRunLog.actions.length === 0) {
-    setAiStatus('No run actions available for replay.');
-    return;
-  }
-
-  state.replay.active = true;
-  setControlMode('ai');
-  ui.startAiButton.disabled = true;
-  ui.stopAiButton.disabled = false;
-  ui.stopAiButton.textContent = 'Stop Replay';
-
-  setAiStatus(`Replaying run ${state.lastRunLog.runId}...`);
-  ui.assistantText.textContent = 'Replaying deterministic tool actions from the last run.';
-
-  clearCanvas({ source: 'replay', skipLog: true });
-
-  const actions = [...state.lastRunLog.actions].sort((a, b) => a.atMs - b.atMs);
-  let lastAtMs = 0;
-
-  for (const actionEntry of actions) {
-    lastAtMs = Math.max(lastAtMs, actionEntry.atMs);
-    const timer = setTimeout(() => {
-      applyReplayAction(actionEntry);
-    }, actionEntry.atMs);
-    state.replay.timers.push(timer);
-  }
-
-  const completeTimer = setTimeout(() => {
-    stopReplay('Replay complete.');
-  }, lastAtMs + 350);
-  state.replay.timers.push(completeTimer);
-}
-
-function applyReplayAction(actionEntry) {
-  if (!state.replay.active) return;
-
-  switch (actionEntry.kind) {
-    case 'draw_action':
-      replayUndoStack.push(ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT));
-      if (replayUndoStack.length > UNDO_MAX_SNAPSHOTS) replayUndoStack.shift();
-      executeDrawAction(actionEntry.payload, { source: 'replay', skipLog: true });
-      break;
-    case 'fill_rectangle':
-      replayUndoStack.push(ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT));
-      if (replayUndoStack.length > UNDO_MAX_SNAPSHOTS) replayUndoStack.shift();
-      fillRectangleAction(actionEntry.payload, { source: 'replay', skipLog: true });
-      break;
-    case 'clear_canvas':
-      replayUndoStack.push(ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT));
-      if (replayUndoStack.length > UNDO_MAX_SNAPSHOTS) replayUndoStack.shift();
-      clearCanvas({ source: 'replay', skipLog: true });
-      break;
-    case 'undo': {
-      if (replayUndoStack.length > 0) {
-        const snapshot = replayUndoStack.pop();
-        ctx.putImageData(snapshot, 0, 0);
-      }
-      break;
-    }
-    case 'undo_to_screenshot': {
-      if (replayLastScreenshotImageData) {
-        ctx.putImageData(replayLastScreenshotImageData, 0, 0);
-        replayUndoStack = [];
-      }
-      break;
-    }
-    case 'take_screenshot':
-      replayLastScreenshotImageData = ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-      break;
-    default:
-      break;
-  }
-}
-
-function stopReplay(message) {
-  if (!state.replay.active) return;
-
-  for (const timer of state.replay.timers) {
-    clearTimeout(timer);
-  }
-  state.replay.timers = [];
-  state.replay.active = false;
-  replayUndoStack = [];
-  replayLastScreenshotImageData = null;
-
-  ui.stopAiButton.textContent = 'Stop';
-  ui.stopAiButton.disabled = true;
-  ui.startAiButton.disabled = false;
-
-  setControlMode('human');
-  setAiStatus(message);
-}
-
 function downloadLastRunLog() {
   if (!state.lastRunLog) return;
   const data = JSON.stringify(state.lastRunLog, null, 2);
@@ -2030,37 +2350,734 @@ function downloadLastRunLog() {
   URL.revokeObjectURL(url);
 }
 
+// ── Results Gallery ──
+
+function addResultCard(result, imageDataUrl) {
+  if (!ui.resultsGallery) return;
+
+  const card = document.createElement('div');
+  card.className = 'result-card';
+
+  const img = document.createElement('img');
+  img.src = imageDataUrl;
+  img.alt = `Result: ${result.prompt || ''}`.slice(0, 120);
+  card.appendChild(img);
+
+  const meta = document.createElement('div');
+  meta.className = 'result-meta';
+
+  const modelDiv = document.createElement('div');
+  modelDiv.className = 'result-model';
+  modelDiv.textContent = result.model || 'unknown';
+  meta.appendChild(modelDiv);
+
+  const promptDiv = document.createElement('div');
+  promptDiv.textContent = truncateTextForStatus(result.prompt || '', 60);
+  meta.appendChild(promptDiv);
+
+  const statsDiv = document.createElement('div');
+  const durationText = result.durationSec !== null ? `${Math.round(result.durationSec)}s` : '--';
+  statsDiv.textContent = `${durationText} | ${result.actionCount || 0} actions`;
+  meta.appendChild(statsDiv);
+
+  const statusSpan = document.createElement('span');
+  statusSpan.className = 'result-status ' + (result.finishedByAgent ? 'success' : 'failure');
+  statusSpan.textContent = result.finishedByAgent ? 'Finished' : 'Stopped';
+  meta.appendChild(statusSpan);
+
+  card.appendChild(meta);
+
+  card.addEventListener('click', () => {
+    openResultOverlay(result, imageDataUrl);
+  });
+
+  ui.resultsGallery.appendChild(card);
+}
+
+function clearResultsGallery() {
+  if (!ui.resultsGallery) return;
+  ui.resultsGallery.innerHTML = '';
+}
+
+function openResultOverlay(result, imageDataUrl) {
+  if (!ui.resultCardOverlay) return;
+
+  ui.overlayImage.src = imageDataUrl;
+  ui.overlayMeta.innerHTML = '';
+
+  const fields = [
+    ['Model', result.model],
+    ['Prompt', result.prompt],
+    ['Duration', result.durationSec !== null ? `${result.durationSec.toFixed(1)}s` : '--'],
+    ['Actions', result.actionCount],
+    ['Screenshots', result.screenshotActions],
+    ['Reflections', result.reflectActions],
+    ['Finished by agent', result.finishedByAgent ? 'Yes' : 'No'],
+    ['Final reason', result.finalReason],
+    ['Run ID', result.runId],
+    ['Log file', result.logFile || '--']
+  ];
+
+  for (const [label, value] of fields) {
+    const div = document.createElement('div');
+    div.innerHTML = `<strong>${label}:</strong> ${escapeHtml(String(value ?? ''))}`;
+    ui.overlayMeta.appendChild(div);
+  }
+
+  ui.resultCardOverlay.style.display = '';
+}
+
+function closeResultOverlay() {
+  if (!ui.resultCardOverlay) return;
+  ui.resultCardOverlay.style.display = 'none';
+  ui.overlayImage.src = '';
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Eval Matrix ──
+
+async function startEvalMatrix() {
+  if (state.evalRunner.active) return;
+  if (state.aiRun?.active) {
+    setEvalStatus('Eval: wait for the current run to finish.');
+    return;
+  }
+  setPanelMode('eval');
+
+  let config;
+  try {
+    config = collectEvalMatrixConfigFromUi();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setEvalStatus(`Eval: invalid configuration - ${message}`);
+    return;
+  }
+
+  const queue = buildEvalQueue(config);
+  if (queue.length === 0) {
+    setEvalStatus('Eval: no combinations to run.');
+    return;
+  }
+
+  state.evalRunner.active = true;
+  state.evalRunner.stopRequested = false;
+  state.evalRunner.queue = queue;
+  state.evalRunner.results = [];
+  state.evalRunner.startedAt = Date.now();
+  state.evalRunner.config = config;
+  state.evalRunner.runByRunId = new Map();
+  state.evalRunner.current = null;
+  state.insideEvalMatrix = true;
+  updateEvalUi();
+
+  clearResultsGallery();
+
+  const tagNote = config.tag ? ` tag=${config.tag}` : '';
+  setEvalStatus(
+    `Eval: queued ${queue.length} run(s) across ${config.models.length} model batch(es).${tagNote}`
+  );
+  setAiStatus(`eval matrix running (${queue.length} runs)...`);
+  let failedMessage = null;
+
+  try {
+    for (let i = 0; i < queue.length; i += 1) {
+      if (state.evalRunner.stopRequested) break;
+
+      const item = queue[i];
+      state.evalRunner.current = {
+        index: i + 1,
+        total: queue.length,
+        item
+      };
+
+      setEvalStatus([
+        `Eval: running ${i + 1}/${queue.length}`,
+        `batch=${item.modelBatchIndex || '?'} / ${item.modelBatchCount || config.models.length} model=${item.model} max=${item.maxRunSeconds}s`,
+        `grid=${item.gridForScreenshots} clear=${item.allowClearTool}`,
+        `prompt=${truncateTextForStatus(item.prompt, 100)}`
+      ].join('\n'));
+
+      if (config.clearCanvasEachRun) {
+        clearCanvas({ source: 'eval', skipLog: true });
+      }
+
+      state.pendingRunOverrides = {
+        prompt: item.prompt,
+        model: item.model,
+        maxRunSeconds: item.maxRunSeconds,
+        allowClearTool: item.allowClearTool,
+        gridForScreenshots: item.gridForScreenshots,
+        evalMeta: {
+          tag: config.tag || null,
+          matrixId: config.matrixId,
+          row: i + 1,
+          totalRows: queue.length,
+          comboIndex: item.comboIndex,
+          repeat: item.repeat,
+          comboKey: item.comboKey,
+          promptIndex: item.promptIndex,
+          modelBatchIndex: item.modelBatchIndex,
+          modelBatchCount: item.modelBatchCount
+        }
+      };
+
+      await startAiRun();
+      const runId = state.aiRun?.id;
+      if (!runId) {
+        throw new Error(`Run ${i + 1} failed to start.`);
+      }
+
+      const runLog = await waitForRunLogAndAutosave(
+        runId,
+        Math.max((item.maxRunSeconds + 120) * 1000, 45_000)
+      );
+      const result = summarizeEvalRun(item, runLog);
+      state.evalRunner.results.push(result);
+      state.evalRunner.runByRunId.set(result.runId, result);
+      updateEvalUi();
+
+      const successes = state.evalRunner.results.filter((entry) => entry.finishedByAgent).length;
+      setEvalStatus([
+        `Eval: completed ${state.evalRunner.results.length}/${queue.length}`,
+        `successes=${successes}`,
+        `lastReason=${result.finalReason || '(none)'}`
+      ].join('\n'));
+
+      if (state.evalRunner.stopRequested) break;
+      if (config.pauseMs > 0 && i < queue.length - 1) {
+        let waitedMs = 0;
+        while (waitedMs < config.pauseMs && !state.evalRunner.stopRequested) {
+          const stepMs = Math.min(250, config.pauseMs - waitedMs);
+          await sleep(stepMs);
+          waitedMs += stepMs;
+        }
+      }
+
+      const nextItem = i < queue.length - 1 ? queue[i + 1] : null;
+      const modelChanged = Boolean(nextItem && nextItem.model !== item.model);
+      if (modelChanged && config.modelBatchPauseMs > 0 && !state.evalRunner.stopRequested) {
+        setEvalStatus([
+          `Eval: completed model batch ${item.modelBatchIndex || '?'} / ${item.modelBatchCount || config.models.length}`,
+          `Pausing ${config.modelBatchPauseMs}ms before next model (${nextItem.model})...`
+        ].join('\n'));
+
+        let waitedMs = 0;
+        while (waitedMs < config.modelBatchPauseMs && !state.evalRunner.stopRequested) {
+          const stepMs = Math.min(250, config.modelBatchPauseMs - waitedMs);
+          await sleep(stepMs);
+          waitedMs += stepMs;
+        }
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    failedMessage = message;
+    setEvalStatus(`Eval: aborted - ${message}`);
+  } finally {
+    const total = state.evalRunner.results.length;
+    const successes = state.evalRunner.results.filter((entry) => entry.finishedByAgent).length;
+    const elapsedSeconds = state.evalRunner.startedAt
+      ? Math.round((Date.now() - state.evalRunner.startedAt) / 1000)
+      : 0;
+    const wasStopped = state.evalRunner.stopRequested;
+
+    state.evalRunner.active = false;
+    state.evalRunner.stopRequested = false;
+    state.evalRunner.current = null;
+    state.insideEvalMatrix = false;
+    updateEvalUi();
+
+    if (failedMessage) {
+      setEvalStatus(`Eval: failed. runs=${total}, successes=${successes}, error=${failedMessage}`);
+      setAiStatus(`eval matrix failed (${successes}/${total} successes).`);
+      return;
+    }
+
+    setEvalStatus(`Eval: ${wasStopped ? 'stopped' : 'complete'}. runs=${total}, successes=${successes}, elapsed=${elapsedSeconds}s.`);
+    setAiStatus(`eval matrix ${wasStopped ? 'stopped' : 'complete'} (${successes}/${total} successes).`);
+  }
+}
+
+function stopEvalMatrix() {
+  if (!state.evalRunner.active) return;
+  state.evalRunner.stopRequested = true;
+  setEvalStatus('Eval: stop requested. Waiting for current run to finish.');
+  if (state.aiRun?.active) {
+    stopAiRun('Stopped by eval matrix.', { manual: true });
+  }
+}
+
+function collectEvalMatrixConfigFromUi() {
+  const prompts = parseLineList(ui.evalPrompts.value);
+  if (prompts.length === 0) {
+    const fallbackPrompt = String(ui.aiPrompt.value || '').trim();
+    if (fallbackPrompt) {
+      prompts.push(fallbackPrompt);
+    }
+  }
+  if (prompts.length === 0) {
+    throw new Error('Add at least one prompt.');
+  }
+
+  // Collect models from checkboxes + custom input
+  const models = [];
+  if (ui.evalModelCheckboxes) {
+    const checkboxes = ui.evalModelCheckboxes.querySelectorAll('input[type="checkbox"]');
+    for (const cb of checkboxes) {
+      if (cb.checked) models.push(cb.value);
+    }
+  }
+  if (ui.evalModelsCustom) {
+    const customModels = parseCsvStringList(ui.evalModelsCustom.value);
+    for (const m of customModels) {
+      if (!models.includes(m)) models.push(m);
+    }
+  }
+  if (models.length === 0) {
+    throw new Error('Select at least one model.');
+  }
+
+  const maxRunSecondsValues = parseCsvNumberList(
+    ui.evalMaxRunSeconds.value,
+    (value) => clamp(Math.round(value), MIN_MAX_RUN_SECONDS, MAX_MAX_RUN_SECONDS),
+    'max run seconds'
+  );
+  if (maxRunSecondsValues.length === 0) {
+    throw new Error('Add at least one max run seconds value.');
+  }
+
+  const gridModes = parseCsvBooleanList(ui.evalGridModes.value, 'grid modes');
+  if (gridModes.length === 0) {
+    throw new Error('Add at least one grid mode.');
+  }
+
+  const allowClearModes = parseCsvBooleanList(ui.evalAllowClearModes.value, 'clear modes');
+  if (allowClearModes.length === 0) {
+    throw new Error('Add at least one clear mode.');
+  }
+
+  const repeats = clamp(Math.round(Number(ui.evalRepeats.value) || 1), 1, 20);
+  ui.evalRepeats.value = String(repeats);
+
+  const pauseMs = clamp(Math.round(Number(ui.evalPauseMs.value) || 0), 0, 60_000);
+  ui.evalPauseMs.value = String(pauseMs);
+
+  const modelBatchPauseMs = clamp(Math.round(Number(ui.evalModelBatchPauseMs.value) || 0), 0, 300_000);
+  ui.evalModelBatchPauseMs.value = String(modelBatchPauseMs);
+
+  const tagInput = String(ui.evalTag.value || '').trim();
+  const tag = tagInput ? sanitizeFilenameSegment(tagInput, '') : '';
+  if (tagInput && !tag) {
+    throw new Error('Eval tag contains only invalid characters.');
+  }
+
+  return {
+    prompts,
+    models,
+    maxRunSecondsValues,
+    gridModes,
+    allowClearModes,
+    repeats,
+    pauseMs,
+    modelBatchPauseMs,
+    clearCanvasEachRun: Boolean(ui.evalClearCanvasEachRun.checked),
+    tag,
+    matrixId: `eval-${formatTimestampForFilename(new Date())}-${Math.floor(Math.random() * 10_000)}`
+  };
+}
+
+function buildEvalQueue(config) {
+  const queue = [];
+  let comboIndex = 0;
+
+  for (let modelIndex = 0; modelIndex < config.models.length; modelIndex += 1) {
+    const model = config.models[modelIndex];
+    for (let promptIndex = 0; promptIndex < config.prompts.length; promptIndex += 1) {
+      const prompt = config.prompts[promptIndex];
+      for (const maxRunSeconds of config.maxRunSecondsValues) {
+        for (const gridForScreenshots of config.gridModes) {
+          for (const allowClearTool of config.allowClearModes) {
+            comboIndex += 1;
+            const comboKey = [
+              `model=${model}`,
+              `max=${maxRunSeconds}`,
+              `grid=${gridForScreenshots}`,
+              `clear=${allowClearTool}`,
+              `prompt=${quickHash(prompt)}`
+            ].join('|');
+
+            for (let repeat = 1; repeat <= config.repeats; repeat += 1) {
+              queue.push({
+                comboIndex,
+                repeat,
+                comboKey,
+                modelBatchIndex: modelIndex + 1,
+                modelBatchCount: config.models.length,
+                promptIndex: promptIndex + 1,
+                prompt,
+                model,
+                maxRunSeconds,
+                gridForScreenshots,
+                allowClearTool
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return queue;
+}
+
+async function waitForRunLogAndAutosave(runId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const log = state.lastRunLog;
+    if (log && log.runId === runId && log.endedAt) {
+      const pending = Boolean(log.storage?.pending);
+      if (!pending) {
+        return cloneJson(log);
+      }
+    }
+    await sleep(220);
+  }
+
+  throw new Error(`Timed out waiting for run ${runId} autosave.`);
+}
+
+function summarizeEvalRun(item, runLog) {
+  const events = Array.isArray(runLog?.events) ? runLog.events : [];
+  const actions = Array.isArray(runLog?.actions) ? runLog.actions : [];
+  const settings = runLog?.settings && typeof runLog.settings === 'object'
+    ? runLog.settings
+    : {};
+  const evalMeta = settings.eval && typeof settings.eval === 'object'
+    ? settings.eval
+    : {};
+
+  const toolCallCounts = {};
+  const blockedReasons = [];
+  for (const event of events) {
+    if (event?.kind === 'tool_call') {
+      const name = String(event.payload?.name || '');
+      if (!name) continue;
+      toolCallCounts[name] = (toolCallCounts[name] || 0) + 1;
+    }
+    if (event?.kind === 'tool_result' && event.payload?.result?.blocked) {
+      blockedReasons.push(String(event.payload.result.reason || 'blocked'));
+    }
+  }
+
+  const startedMs = Date.parse(String(runLog?.startedAt || ''));
+  const endedMs = Date.parse(String(runLog?.endedAt || ''));
+  const durationSec = Number.isFinite(startedMs) && Number.isFinite(endedMs)
+    ? Math.max(0, (endedMs - startedMs) / 1000)
+    : null;
+
+  return {
+    evalTag: String(evalMeta.tag || ''),
+    matrixId: String(evalMeta.matrixId || ''),
+    row: Number.isFinite(Number(evalMeta.row)) ? Number(evalMeta.row) : null,
+    comboIndex: Number.isFinite(Number(evalMeta.comboIndex)) ? Number(evalMeta.comboIndex) : item.comboIndex,
+    repeat: Number.isFinite(Number(evalMeta.repeat)) ? Number(evalMeta.repeat) : item.repeat,
+    modelBatchIndex: Number.isFinite(Number(evalMeta.modelBatchIndex)) ? Number(evalMeta.modelBatchIndex) : item.modelBatchIndex,
+    modelBatchCount: Number.isFinite(Number(evalMeta.modelBatchCount)) ? Number(evalMeta.modelBatchCount) : item.modelBatchCount,
+    runId: String(runLog?.runId || ''),
+    model: String(runLog?.model || item.model),
+    prompt: String(runLog?.prompt || item.prompt),
+    maxRunSeconds: clamp(
+      Math.round(Number(runLog?.maxRunSeconds ?? item.maxRunSeconds) || item.maxRunSeconds),
+      MIN_MAX_RUN_SECONDS,
+      MAX_MAX_RUN_SECONDS
+    ),
+    gridForScreenshots: typeof settings.gridForScreenshots === 'boolean'
+      ? settings.gridForScreenshots
+      : item.gridForScreenshots,
+    allowClearTool: typeof settings.allowClearTool === 'boolean'
+      ? settings.allowClearTool
+      : item.allowClearTool,
+    startedAt: String(runLog?.startedAt || ''),
+    endedAt: String(runLog?.endedAt || ''),
+    durationSec,
+    finishedByAgent: Boolean(runLog?.finishedByAgent),
+    finalReason: String(runLog?.finalReason || ''),
+    actionCount: actions.length,
+    eventCount: events.length,
+    screenshotActions: actions.filter((entry) => entry?.kind === 'take_screenshot').length,
+    reflectActions: actions.filter((entry) => entry?.kind === 'reflect').length,
+    undoActions: actions.filter((entry) => entry?.kind === 'undo' || entry?.kind === 'undo_to_screenshot').length,
+    toolCallsTotal: Object.values(toolCallCounts).reduce((sum, count) => sum + count, 0),
+    strokeLineCalls: toolCallCounts.stroke_line || 0,
+    strokePolylineCalls: toolCallCounts.stroke_polyline || 0,
+    fillRectangleCalls: toolCallCounts.fill_rectangle || 0,
+    sprayClusterCalls: toolCallCounts.spray_cluster || 0,
+    floodFillCalls: toolCallCounts.flood_fill || 0,
+    takeScreenshotCalls: toolCallCounts.take_screenshot || 0,
+    reflectCalls: toolCallCounts.reflect || 0,
+    finishCalls: toolCallCounts.finish || 0,
+    blockedCount: blockedReasons.length,
+    blockedReasons: blockedReasons.join('|'),
+    autosaved: Boolean(runLog?.storage?.autosaved),
+    logFile: String(runLog?.storage?.logFile || ''),
+    finalImageFile: String(runLog?.storage?.finalImageFile || ''),
+    storageError: String(runLog?.storage?.error || '')
+  };
+}
+
+function updateEvalUi() {
+  const evalActive = state.evalRunner.active;
+  const busy = Boolean(state.aiRun?.active);
+  const disableInputs = evalActive || busy;
+  const lockTabs = evalActive || busy;
+
+  if (evalActive && state.panelMode !== 'eval') {
+    state.panelMode = 'eval';
+    updatePanelModeUi();
+  } else if (busy && !state.insideEvalMatrix && state.panelMode !== 'run') {
+    state.panelMode = 'run';
+    updatePanelModeUi();
+  }
+
+  for (const tab of ui.panelModeTabs) {
+    tab.disabled = lockTabs;
+  }
+
+  const evalInputs = [
+    ui.evalMaxRunSeconds,
+    ui.evalGridModes,
+    ui.evalAllowClearModes,
+    ui.evalRepeats,
+    ui.evalPauseMs,
+    ui.evalModelBatchPauseMs,
+    ui.evalTag,
+    ui.evalClearCanvasEachRun,
+    ui.evalModelsCustom
+  ];
+  for (const input of evalInputs) {
+    if (input) input.disabled = disableInputs;
+  }
+
+  // Disable eval prompts textarea
+  if (ui.evalPrompts) ui.evalPrompts.disabled = disableInputs;
+
+  // Disable model checkboxes
+  if (ui.evalModelCheckboxes) {
+    const checkboxes = ui.evalModelCheckboxes.querySelectorAll('input[type="checkbox"]');
+    for (const cb of checkboxes) {
+      cb.disabled = disableInputs;
+    }
+  }
+
+  ui.startEvalMatrix.disabled = evalActive || busy;
+  ui.stopEvalMatrix.disabled = !evalActive;
+  ui.downloadEvalCsv.disabled = evalActive || state.evalRunner.results.length === 0;
+
+  if (evalActive) {
+    ui.startAiButton.disabled = true;
+    ui.downloadLog.disabled = true;
+  }
+}
+
+function setEvalStatus(message) {
+  if (!ui.evalStatus) return;
+  ui.evalStatus.textContent = `Eval: ${String(message || '').replace(/^Eval:\s*/i, '')}`;
+}
+
+function parseLineList(rawValue) {
+  return String(rawValue || '')
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function parseCsvStringList(rawValue) {
+  const entries = String(rawValue || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return uniquePrimitiveList(entries);
+}
+
+function parseCsvNumberList(rawValue, mapper, label) {
+  const tokens = String(rawValue || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const values = [];
+  for (const token of tokens) {
+    const parsed = Number(token);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(`Invalid ${label} value "${token}".`);
+    }
+    values.push(mapper(parsed));
+  }
+  return uniquePrimitiveList(values);
+}
+
+function parseCsvBooleanList(rawValue, label) {
+  const tokens = String(rawValue || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const values = [];
+  for (const token of tokens) {
+    const parsed = parseBooleanToken(token);
+    if (parsed === null) {
+      throw new Error(`Invalid ${label} value "${token}" (use true/false).`);
+    }
+    values.push(parsed);
+  }
+
+  return uniquePrimitiveList(values);
+}
+
+function parseBooleanToken(rawValue) {
+  const normalized = String(rawValue || '').trim().toLowerCase();
+  if (['true', 't', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
+  if (['false', 'f', '0', 'no', 'n', 'off'].includes(normalized)) return false;
+  return null;
+}
+
+function uniquePrimitiveList(values) {
+  return Array.from(new Set(values));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, ms));
+  });
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function truncateTextForStatus(text, maxLen) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  if (raw.length <= maxLen) return raw;
+  return `${raw.slice(0, Math.max(1, maxLen - 3))}...`;
+}
+
+function downloadEvalCsv() {
+  if (state.evalRunner.results.length === 0) {
+    setEvalStatus('Eval: no results available yet.');
+    return;
+  }
+
+  const headers = [
+    'evalTag',
+    'matrixId',
+    'row',
+    'comboIndex',
+    'repeat',
+    'modelBatchIndex',
+    'modelBatchCount',
+    'runId',
+    'model',
+    'maxRunSeconds',
+    'gridForScreenshots',
+    'allowClearTool',
+    'finishedByAgent',
+    'finalReason',
+    'durationSec',
+    'actionCount',
+    'eventCount',
+    'screenshotActions',
+    'reflectActions',
+    'undoActions',
+    'toolCallsTotal',
+    'strokeLineCalls',
+    'strokePolylineCalls',
+    'fillRectangleCalls',
+    'sprayClusterCalls',
+    'floodFillCalls',
+    'takeScreenshotCalls',
+    'reflectCalls',
+    'finishCalls',
+    'blockedCount',
+    'blockedReasons',
+    'autosaved',
+    'storageError',
+    'logFile',
+    'finalImageFile',
+    'prompt'
+  ];
+
+  const lines = [headers.join(',')];
+  for (const result of state.evalRunner.results) {
+    const row = headers.map((header) => toCsvCell(result[header]));
+    lines.push(row.join(','));
+  }
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const tagPart = sanitizeFilenameSegment(state.evalRunner.config?.tag || 'eval-matrix', 'eval-matrix');
+  const stampPart = formatTimestampForFilename(new Date());
+
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${tagPart}_${stampPart}.csv`;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+function toCsvCell(value) {
+  if (value === null || value === undefined) return '';
+  const stringValue = String(value);
+  if (/[",\n\r]/.test(stringValue)) {
+    return `"${stringValue.replace(/"/g, '""')}"`;
+  }
+  return stringValue;
+}
+
+function sanitizeEvalMeta(rawMeta) {
+  if (!rawMeta || typeof rawMeta !== 'object') return null;
+
+  const tag = String(rawMeta.tag || '').trim().slice(0, 80);
+  const matrixId = String(rawMeta.matrixId || '').trim().slice(0, 96);
+  const row = Number(rawMeta.row);
+  const totalRows = Number(rawMeta.totalRows);
+  const comboIndex = Number(rawMeta.comboIndex);
+  const repeat = Number(rawMeta.repeat);
+  const comboKey = String(rawMeta.comboKey || '').trim().slice(0, 280);
+  const promptIndex = Number(rawMeta.promptIndex);
+  const modelBatchIndex = Number(rawMeta.modelBatchIndex);
+  const modelBatchCount = Number(rawMeta.modelBatchCount);
+
+  const out = {};
+  if (tag) out.tag = tag;
+  if (matrixId) out.matrixId = matrixId;
+  if (Number.isFinite(row)) out.row = Math.max(1, Math.round(row));
+  if (Number.isFinite(totalRows)) out.totalRows = Math.max(1, Math.round(totalRows));
+  if (Number.isFinite(comboIndex)) out.comboIndex = Math.max(1, Math.round(comboIndex));
+  if (Number.isFinite(repeat)) out.repeat = Math.max(1, Math.round(repeat));
+  if (comboKey) out.comboKey = comboKey;
+  if (Number.isFinite(promptIndex)) out.promptIndex = Math.max(1, Math.round(promptIndex));
+  if (Number.isFinite(modelBatchIndex)) out.modelBatchIndex = Math.max(1, Math.round(modelBatchIndex));
+  if (Number.isFinite(modelBatchCount)) out.modelBatchCount = Math.max(1, Math.round(modelBatchCount));
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function setControlMode(mode) {
   state.mode = mode;
-  updateModeUi();
 
-  const lockTools = mode !== 'human' || state.replay.active;
-  for (const button of ui.toolButtons) button.disabled = lockTools;
-  ui.colorPicker.disabled = lockTools;
-  ui.lineWidth.disabled = lockTools;
-  ui.clearButton.disabled = lockTools;
-
+  // Disable/enable eval inputs during runs
   ui.aiPrompt.disabled = mode !== 'human';
-  ui.modelInput.disabled = mode !== 'human';
-  ui.temperatureInput.disabled = mode !== 'human';
+  if (ui.modelSelect) ui.modelSelect.disabled = mode !== 'human';
+  if (ui.modelCustom) ui.modelCustom.disabled = mode !== 'human';
   ui.maxRunSeconds.disabled = mode !== 'human';
   ui.allowClearTool.disabled = mode !== 'human';
   ui.gridForScreenshots.disabled = mode !== 'human';
 
-  canvas.classList.toggle('locked', lockTools);
-}
-
-function updateModeUi() {
-  if (state.mode === 'ai') {
-    ui.modeBadge.textContent = 'Mode: AI Control';
-    ui.modeBadge.classList.remove('mode-human');
-    ui.modeBadge.classList.add('mode-ai');
-    return;
-  }
-
-  ui.modeBadge.textContent = 'Mode: Human';
-  ui.modeBadge.classList.remove('mode-ai');
-  ui.modeBadge.classList.add('mode-human');
+  updateEvalUi();
 }
 
 function setAiStatus(message) {
@@ -2071,25 +3088,12 @@ function updateRunTimer(value) {
   ui.runTimer.textContent = `Timer: ${value}`;
 }
 
-function updateTemperatureLabel(value) {
-  if (!ui.temperatureValue) return;
-  const normalized = normalizeTemperature(value);
-  ui.temperatureValue.textContent = normalized.toFixed(1);
-}
-
 function normalizeColor(value) {
   const raw = String(value || '').trim();
   if (/^#[0-9a-fA-F]{6}$/.test(raw)) {
     return raw.toUpperCase();
   }
   return '#000000';
-}
-
-function normalizeTemperature(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return DEFAULT_TEMPERATURE;
-  const rounded = Math.round(parsed * 10) / 10;
-  return clamp(rounded, MIN_TEMPERATURE, MAX_TEMPERATURE);
 }
 
 function clamp(value, min, max) {
